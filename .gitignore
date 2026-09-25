@@ -1,0 +1,18 @@
+# 真实配置：含加密密钥与端点信息，永不入库
+.llm_probe.env
+*.env.local
+
+# 口令文件（如果有人把 LLM_PASSPHRASE_FILE 指到仓库里）
+*.pass
+*.passphrase
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 测试临时产物
+*.log
+mock.log

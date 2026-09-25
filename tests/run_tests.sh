@@ -1,7 +1,7 @@
 #!/bin/sh
-# llm_probe 分支测试：mock 服务 + py/sh 双实现，44 项断言
+# llm_probe 分支测试：mock 服务 + py/sh 双实现，16 组场景、70 项断言
 # 用法: ./run_tests.sh          （需 curl、openssl、python3；会短暂占用 18923 端口）
-# 全部通过时输出 PASS=44 FAIL=0，退出码 0
+# 全部通过时输出 PASS=70 FAIL=0，退出码 0
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_DIR=$(dirname "$SCRIPT_DIR")
 LOGDIR=$(mktemp -d)
@@ -272,7 +272,7 @@ for mode in ok unauthorized badpath badmodel ratelimit noreduce; do
     BRC=$?
     stop_mock
     python3 - "$LOGDIR"/x.json "$LOGDIR"/y.json "$ARC" "$BRC" >"$LOGDIR"/cmp.log 2>&1 <<'PY'
-import json, sys
+import json, re, sys
 a = json.load(open(sys.argv[1]))
 b = json.load(open(sys.argv[2]))
 ar, br = int(sys.argv[3]), int(sys.argv[4])
@@ -280,6 +280,15 @@ ar, br = int(sys.argv[3]), int(sys.argv[4])
 def norm(d):
     return [(s["name"], bool(s.get("ok")), bool(s.get("skipped", False)))
             for s in d["steps"]]
+
+def detail(d, name):
+    for s in d["steps"]:
+        if s["name"] == name:
+            return s.get("detail", "")
+    return "(缺该步)"
+
+def norm_text(x):      # 耗时是环境相关的，归一化后再比
+    return re.sub(r"\(\d+(\.\d+)?ms\)", "(T)", x)
 
 problems = []
 if not (a["exit_code"] == b["exit_code"] == ar == br):
@@ -292,13 +301,152 @@ for key in ("version", "base_url", "model", "key_masked", "key_source",
             "config", "verdict", "exit_code"):
     if key not in a or key not in b:
         problems.append(f"JSON 缺字段 {key}")
+# L2 / L3 的 detail 文案必须逐字一致（L1 是有意差异：py 报证书信息，
+# sh 报 remote IP 与握手耗时，见 README「两个实现的有意差异」）
+for step in ("L2 认证", "L3 推理"):
+    if norm_text(detail(a, step)) != norm_text(detail(b, step)):
+        problems.append(f"{step} detail {detail(a, step)!r} vs {detail(b, step)!r}")
 if problems:
     print("; ".join(problems))
     sys.exit(1)
 sys.exit(0)
 PY
-    check "$mode: py/sh 退出码+步骤+结论+schema 一致" 0 $?
+    check "$mode: py/sh 退出码+步骤+结论+detail+schema 一致" 0 $?
 done
+
+echo "== 16. 自查发现的缺陷回归 =="
+REG=$(mktemp -d)
+# 16.1 参数错误退出码：argparse 默认 2 会和网络不通撞码
+python3 llm_probe.py probe --timeout abc >/dev/null 2>&1
+check "py 参数非法 → 1（不是 2）" 1 $?
+python3 llm_probe.py probe --no-such-flag >/dev/null 2>&1
+check "py 未知参数 → 1（不是 2）" 1 $?
+# 16.2 显式 0 不能绕过"必须大于 0"（`args.x or ...` 的假值陷阱）
+python3 llm_probe.py -c "$LEAKDIR/zero.env" probe --max-tokens 0 >/dev/null 2>&1
+check "py --max-tokens 0 → 1" 1 $?
+./llm_probe.sh -c "$LEAKDIR/zero.env" probe --timeout 0 >/dev/null 2>&1
+check "sh --timeout 0 → 1" 1 $?
+# 16.3 畸形配置：两端都干净退出 1，且不能出现 traceback
+printf '=空键\n' > "$REG/bad.env"
+python3 llm_probe.py -c "$REG/bad.env" probe >"$LOGDIR"/t30.log 2>&1
+RC=$?
+check "py 畸形配置 → 1" 1 $RC
+grep -q "Traceback" "$LOGDIR"/t30.log && RC=1 || RC=0
+check "py 畸形配置无 traceback" 0 $RC
+./llm_probe.sh -c "$REG/bad.env" probe >"$LOGDIR"/t31.log 2>&1
+RC=$?
+check "sh 畸形配置 → 1（以前会照跑）" 1 $RC
+grep -q "第 1" "$LOGDIR"/t31.log && RC=0 || RC=1
+check "sh 畸形配置指出行号" 0 $RC
+# 16.4 stdin 喂密钥、末尾无换行（README 推荐的写法，sh 以前读不到）
+printf 'sk-no-newline-sh' | ./llm_probe.sh -c "$REG/nl.env" setkey --passphrase 'pw' >/dev/null 2>&1
+GOT=$(./llm_probe.sh -c "$REG/nl.env" showkey --plain --passphrase 'pw' 2>/dev/null)
+[ "$GOT" = "sk-no-newline-sh" ] && RC=0 || RC=1
+check "sh stdin 无尾换行也能 setkey" 0 $RC
+# 16.5 配置里的引号两端都要剥（sh 以前没剥，带引号的密文解不开）
+printf 'sk-quoted\n' | python3 llm_probe.py -c "$REG/q.env" setkey --passphrase 'pw' >/dev/null 2>&1
+python3 - "$REG/q.env" <<'PY'
+import sys
+p = sys.argv[1]
+lines = [l for l in open(p, encoding="utf-8").read().splitlines()]
+out = []
+for l in lines:
+    if l.startswith("LLM_API_KEY_ENC=enc:v1:"):
+        l = 'LLM_API_KEY_ENC="' + l.split("=", 1)[1] + '"'
+    out.append(l)
+open(p, "w", encoding="utf-8").write("\n".join(out) + "\n")
+PY
+GOT=$(./llm_probe.sh -c "$REG/q.env" showkey --plain --passphrase 'pw' 2>/dev/null)
+[ "$GOT" = "sk-quoted" ] && RC=0 || RC=1
+check "sh 能解开带引号的密文配置" 0 $RC
+# 16.5b 双引号剥离（sh 的 case 模式写坏过，所有 "值" 都会带着引号跑）
+printf 'LLM_BASE_URL="http://127.0.0.1:18923/v1"\nLLM_PROMPT="带 空格 的提示"\n' > "$REG/quote.env"
+GOT=$(./llm_probe.sh -c "$REG/quote.env" env 2>/dev/null | sed -n 's/^LLM_BASE_URL *= //p')
+[ "$GOT" = "http://127.0.0.1:18923/v1" ] && RC=0 || RC=1
+check "sh 剥双引号（base_url 以前带引号）" 0 $RC
+GOT=$(python3 llm_probe.py -c "$REG/quote.env" env 2>/dev/null | sed -n 's/^LLM_BASE_URL *= //p')
+[ "$GOT" = "http://127.0.0.1:18923/v1" ] && RC=0 || RC=1
+check "py 剥双引号" 0 $RC
+GOT=$(./llm_probe.sh -c "$REG/quote.env" env 2>/dev/null | sed -n 's/^LLM_PROMPT *= //p')
+[ "$GOT" = "带 空格 的提示" ] && RC=0 || RC=1
+check "sh 剥双引号且保留内部空格" 0 $RC
+# 16.6 口令文件路径里的 ~ 要展开（py 用 expanduser，sh 以前找不到）
+printf 'pw-tilde' > "$HOME/.llm_probe_test_pw"
+printf 'LLM_PASSPHRASE_FILE=~/.llm_probe_test_pw\n' > "$REG/tilde.env"
+python3 llm_probe.py -c "$REG/tilde.env" setkey --key 'sk-tilde-py' >/dev/null 2>&1
+GOT=$(./llm_probe.sh -c "$REG/tilde.env" showkey --plain 2>/dev/null)
+rm -f "$HOME/.llm_probe_test_pw"
+[ "$GOT" = "sk-tilde-py" ] && RC=0 || RC=1
+check "sh 口令文件 ~ 展开（与 py 一致）" 0 $RC
+# 16.7 用 --key 时，环境里那份 LLM_API_KEY 也要摘掉
+printf 'LLM_BASE_URL=http://127.0.0.1:18923/v1\nLLM_MODEL=mock-a\n' > "$REG/probe.env"
+KEYSHIM="$LOGDIR/keyshim"
+mkdir -p "$KEYSHIM"
+cat > "$KEYSHIM/curl" <<SHIMEOF
+#!/bin/sh
+env | grep -c '^LLM_API_KEY=' >> "$LOGDIR/curl_key"
+exec $REAL_CURL "$@"
+SHIMEOF
+chmod +x "$KEYSHIM/curl"
+rm -f "$LOGDIR/curl_key"
+LLM_API_KEY='sk-env-should-be-scrubbed' PATH="$KEYSHIM:$PATH" \
+    ./llm_probe.sh -c "$REG/probe.env" probe --only net --key 'sk-cli-arg' >/dev/null 2>&1
+# 先确认 curl 真的跑起来了，否则"没泄漏"是假通过
+[ -f "$LOGDIR/curl_key" ] && RC=0 || RC=1
+check "sh curl 子进程确实被执行（防止假通过）" 0 $RC
+grep -q '^[1-9]' "$LOGDIR/curl_key" 2>/dev/null && RC=1 || RC=0
+check "sh --key 时环境 key 不传子进程" 0 $RC
+LLM_API_KEY='sk-env-should-be-scrubbed' python3 - >/dev/null 2>&1 <<'PY'
+import os, sys
+sys.path.insert(0, ".")
+import llm_probe
+
+class A:
+    key = "sk-cli-arg"
+    passphrase = None
+
+llm_probe.resolve_key(A(), {})
+sys.exit(0 if "LLM_API_KEY" not in os.environ else 1)
+PY
+check "py --key 时环境 key 也摘掉" 0 $?
+# --only net 这条路径整段跳过密钥解析，最容易漏掉摘除动作（这里就是回归点）
+rm -f "$LOGDIR/curl_key"
+LLM_API_KEY='sk-env-should-be-scrubbed' PATH="$KEYSHIM:$PATH" \
+    ./llm_probe.sh -c "$REG/probe.env" probe --only net >/dev/null 2>&1
+[ -f "$LOGDIR/curl_key" ] && grep -q '^0$' "$LOGDIR/curl_key" && RC=0 || RC=1
+check "sh --only net 也不把环境 key 传给 curl" 0 $RC
+LLM_API_KEY='sk-env-should-be-scrubbed' python3 - >/dev/null 2>&1 <<PY
+import os, sys
+sys.path.insert(0, ".")
+import llm_probe
+
+args = llm_probe.build_parser().parse_args(
+    ["probe", "-c", "$REG/probe.env", "--only", "net",
+     "--base-url", "http://127.0.0.1:9/v1", "--model", "m"])
+llm_probe.cmd_probe(args)      # 连 127.0.0.1:9 会被立刻拒绝，不产生真实外部流量
+sys.exit(0 if "LLM_API_KEY" not in os.environ else 1)
+PY
+check "py --only net 也摘掉环境 key" 0 $?
+# 16.8 env 子命令传 --key 也要警告（sh 以前不警告）
+./llm_probe.sh -c "$REG/probe.env" env --key 'sk-arg' 2>&1 >/dev/null | grep -q -- "--key" && RC=0 || RC=1
+check "sh env --key 打警告" 0 $RC
+python3 llm_probe.py -c "$REG/probe.env" env --key 'sk-arg' 2>&1 >/dev/null | grep -q -- "--key" && RC=0 || RC=1
+check "py env --key 打警告" 0 $RC
+# 16.9 优先级：命令行 > 环境变量 > 配置，要真的发到线上（mock 校验 max_tokens）
+printf 'LLM_MAX_TOKENS=8\n' > "$REG/pri.env"
+start_mock checkmaxtokens
+LLM_MAX_TOKENS=7 ./llm_probe.sh -c "$REG/pri.env" probe --base-url "$BASE_URL" --model mock-a --key sk-good >/dev/null 2>&1
+check "sh 环境变量 max_tokens 覆盖配置（到了线上）" 0 $?
+./llm_probe.sh -c "$REG/pri.env" probe --base-url "$BASE_URL" --model mock-a --key sk-good --max-tokens 7 >/dev/null 2>&1
+check "sh 命令行 max_tokens 覆盖配置" 0 $?
+./llm_probe.sh -c "$REG/pri.env" probe --base-url "$BASE_URL" --model mock-a --key sk-good >/dev/null 2>&1
+check "sh 配置里的 max_tokens=8 确实发出去了 → 4" 4 $?
+LLM_MAX_TOKENS=7 python3 llm_probe.py -c "$REG/pri.env" probe --base-url "$BASE_URL" --model mock-a --key sk-good >/dev/null 2>&1
+check "py 环境变量 max_tokens 覆盖配置" 0 $?
+python3 llm_probe.py -c "$REG/pri.env" probe --base-url "$BASE_URL" --model mock-a --key sk-good --max-tokens 7 >/dev/null 2>&1
+check "py 命令行 max_tokens 覆盖配置" 0 $?
+stop_mock
+rm -rf "$REG"
 
 echo
 echo "=================================="

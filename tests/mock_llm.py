@@ -8,6 +8,8 @@ MOCK_MODE:
   badmodel     /models 正常，/chat 返回 400（模型不存在）
   ratelimit    /models 正常，/chat 返回 429
   noreduce     /models 404，/chat 正常（模拟不实现 models 的中转站）
+  checkmaxtokens /chat 只接受 max_tokens=7（用来验证"命令行 > 环境变量 > 配置"
+                的优先级真的上了线，而不是只改了本地变量）
 """
 import json
 import os
@@ -73,6 +75,10 @@ class Handler(BaseHTTPRequestHandler):
         if MODE == "badmodel":
             return self._send(400, {"error": {
                 "message": f"model `{model}` does not exist", "type": "invalid_request"}})
+        if MODE == "checkmaxtokens" and req.get("max_tokens") != 7:
+            return self._send(400, {"error": {
+                "message": f"max_tokens 期望 7，实际 {req.get('max_tokens')!r}",
+                "type": "invalid_request"}})
         prompt = ""
         for msg in req.get("messages", []):
             if msg.get("role") == "user":

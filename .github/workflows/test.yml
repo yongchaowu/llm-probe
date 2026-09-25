@@ -1,0 +1,45 @@
+name: test
+
+# 每次 push / PR 都跑：单元测试 + py/sh 跨实现一致性回归。
+# 两个实现的行为一致性是这个项目的核心约束，靠测试钉住，不靠人记。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  ubuntu:
+    name: ubuntu (dash)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 依赖自检
+        run: |
+          command -v curl openssl python3 dash awk sed
+          python3 --version
+          openssl version
+      - name: shell 语法（dash 严格 POSIX）
+        run: dash -n llm_probe.sh && dash -n tests/run_tests.sh
+      - name: 单元测试
+        run: python3 tests/test_units.py
+      - name: py/sh 跨实现回归
+        run: ./tests/run_tests.sh
+      - name: 确认配置没被提交
+        run: |
+          if git ls-files --error-unmatch .llm_probe.env >/dev/null 2>&1; then
+            echo "::error::.llm_probe.env 不允许进仓库"; exit 1
+          fi
+
+  macos:
+    name: macos (系统 sh)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 单元测试
+        run: python3 tests/test_units.py
+      - name: py/sh 跨实现回归
+        # macOS 没有 dash，这里跑的是系统 sh（zsh 兼容模式）+ BSD 用户态工具
+        run: ./tests/run_tests.sh
+      - name: 确认 sh 在 BSD 工具链下也能跑
+        run: sh -n llm_probe.sh

@@ -94,33 +94,39 @@ fi
 
 ```text
 llm-probe/
-├── llm_probe.py            # 974 行，Python 3.7+，零第三方依赖，含 L4 SDK 层
-├── llm_probe.sh            # 851 行，严格 POSIX（dash 验证），只依赖 curl + openssl
+├── llm_probe.py            # 1022 行，Python 3.7+，零第三方依赖，含 L4 SDK 层
+├── llm_probe.sh            # 921 行，严格 POSIX（dash 验证），只依赖 curl + openssl
 ├── llm_probe.env.example   # 配置模板（init 会生成 .llm_probe.env，已 gitignore）
 ├── demo_minimal.py         # 97 行最简 demo：单次 SDK 调用
 ├── docs/                   # 完整技术文章（含两份源码逐行附录）
 ├── skill/                  # OpenCode skill 副本（正本在 ~/.config/opencode/skills/）
 ├── tests/
-│   ├── run_tests.sh        # 15 组场景、44 项断言（含 py/sh 跨实现 JSON 一致性）
-│   ├── test_units.py       # 单元测试：配置解析 / 加解密 / 结论映射 / 密钥卫生
+│   ├── run_tests.sh        # 16 组场景、70 项断言（含 py/sh 跨实现 JSON/detail 一致性）
+│   ├── test_units.py       # 22 项单元测试：配置解析 / 加解密 / 结论映射 / 密钥卫生 / 退出码契约
 │   └── mock_llm.py         # 6 种故障模式的 mock 服务
 ├── README.md
-└── .gitignore              # 忽略 .llm_probe.env、__pycache__
+├── .gitignore              # 忽略 .llm_probe.env、__pycache__
+└── .github/workflows/       # CI：push/PR 自动跑上面两套测试
 ```
 
 ## 测试
 
 ```bash
 ./tests/run_tests.sh        # 需 curl、openssl、python3；短暂占用 18923 端口
-# PASS=44 FAIL=0，退出码 0
-python3 tests/test_units.py # 单元测试也能单独跑（或用 pytest）
+# PASS=70 FAIL=0，退出码 0
+python3 tests/test_units.py # 22 项单元测试也能单独跑（或用 pytest）
 ```
 
-15 组场景覆盖：正常端点、错误密钥、全站 401、路径 404、模型名 400、限流 429、
+16 组场景覆盖：正常端点、错误密钥、全站 401、路径 404、模型名 400、限流 429、
 `/models` 不实现、端口未监听、DNS 失败、非法 scheme、**密文双向互通**、
 **配置文件不被当代码执行**、**口令不泄漏给子进程**、**setkey 走 stdin**、
-**老 openssl 报错**、**py/sh 逐字段结论一致（6 种故障模式）**。
+**老 openssl 报错**、**py/sh 逐字段一致（退出码 + 步骤 + 结论 + L2/L3 detail + schema，6 种故障模式）**、
+**自查发现的缺陷回归**（退出码契约、0 值绕过校验、畸形配置、双引号剥离、`~` 展开、
+`--only net` 泄漏、优先级是否真的到了服务端……）。
 测试刻意不读取真实配置的解密口令。
+
+`.github/workflows/test.yml` 在每次 push/PR 上跑同一套用例（ubuntu 用 dash、
+macos 用系统 sh，顺带验证 BSD 用户态工具链），并检查 `.llm_probe.env` 没被提交。
 
 ## 密钥安全
 
@@ -142,6 +148,25 @@ python3 tests/test_units.py # 单元测试也能单独跑（或用 pytest）
 - 密钥同理：`setkey` 支持从 **stdin 管道**读（`printf '%s' "$KEY" | ... setkey`），
   不进 argv、不进历史；`--key` 会打 stderr 警告。
 - 报告里只输出打码后的密钥 `sk-xxx********xxxx (len=N)`。
+- 不只是"读到才摘"：选了 `--key` 就把环境里的 `LLM_API_KEY` 一并摘掉；
+  `--only net` 这种**根本不读密钥**的路径也会摘——否则它照样会被 curl 继承。
+- **退出码契约不许被占用**：`2` 永远表示"网络不通"。参数拼错（argparse 默认退 2）、
+  配置畸形、`--timeout 0` 这类问题一律退 `1` 并给出可读原因，不吐 traceback。
+- **配置是数据**：两个实现都自己解析（剥引号、展开 `~`、拒绝空 KEY 与非 `KEY=VALUE` 行、
+  校验 timeout/max-tokens 为正数），**不 `source`**，不执行任何一行；坏配置两端都退 1 并指出行号。
+- **优先级只有一条**：`命令行 > 环境变量 > 配置文件`。两个实现一致，并且由 mock 在
+  **服务端**校验 `max_tokens`，确保优先级真的上了线，而不是只改了本地变量。
+
+### 两个实现的有意差异
+
+| 维度 | `llm_probe.py` | `llm_probe.sh` |
+|---|---|---|
+| L1 报告 | 证书 CN、有效期、TLS 版本 | `remote_ip`、连接/握手耗时拆分（curl 拿不到证书链） |
+| `\uXXXX` 解码 | 原生 | 有 python3 时解码，没有就原样返回 |
+| L4 SDK | 支持 | 不支持（提示改用 py 版） |
+
+**其余全部逐字段一致**：退出码、每个步骤的 `ok`/`skipped`、结论文字、L2/L3 的 detail、
+`--json` 字段集合——由第 15 组测试在 6 种故障模式上逐项比对。
 - 配置文件是数据不是脚本：两个实现都自己解析 `KEY=VALUE`（支持引号、拒绝空键），
   **不 `source`**，不执行任何一行。
 

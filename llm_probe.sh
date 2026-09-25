@@ -84,7 +84,13 @@ cleanup() {
     [ -n "$BODY_FILE" ] && rm -f "$BODY_FILE"
     [ -n "$ERR_FILE" ] && rm -f "$ERR_FILE"
 }
-trap cleanup EXIT INT TERM HUP QUIT
+# 收到信号要"清干净 + 立刻退出"：只 cleanup 不 exit 的话，脚本会从被打断的
+# 那一行继续往下跑，Ctrl-C 之后还可能打出一份半截报告。
+trap cleanup EXIT
+trap 'cleanup; trap - INT; exit 130' INT
+trap 'cleanup; trap - TERM; exit 143' TERM
+trap 'cleanup; trap - HUP; exit 129' HUP
+trap 'cleanup; trap - QUIT; exit 131' QUIT
 
 # 临时响应体集中放在一个私有目录里（umask 077 → 0700），退出即删。
 # 注意：kill -9 / SIGKILL 不触发 trap，目录会残留；下次运行是新建目录，不会
@@ -151,36 +157,87 @@ cfg_get() {  # $1 = 变量名；取配置文件里最后一次出现的值
 }
 
 strip_quotes() {
+    # 模式必须写 \"*（转义的双引号 + 任意），不能写 '"'"'"*：
+    # 后者是转义搞坏的产物，实际匹配的是"单引号+双引号"，于是所有双引号
+    # 包裹的值（LLM_BASE_URL="..."）都原样带着引号往下走。
     case $1 in
-        '"'"'"*) printf '%s' "$1" | sed 's/^"//; s/"$//' ;;
-        "'"*)    printf '%s' "$1" | sed "s/^'//; s/'\$//" ;;
-        *)       printf '%s' "$1" ;;
+        \"*)  printf '%s' "$1" | sed 's/^"//; s/"$//' ;;
+        "'"*) printf '%s' "$1" | sed "s/^'//; s/'\$//" ;;
+        *)    printf '%s' "$1" ;;
     esac
 }
 
+expand_tilde() {  # $1 = 路径；补上 shell 不会做的一步（变量里的 ~ 不展开）
+    case $1 in
+        '~')      printf '%s' "$HOME" ;;
+        '~/'*)    _rest=${1#?}                 # 去掉开头的 ~
+                  printf '%s' "$HOME/${_rest#/}" ;;
+        *)        printf '%s' "$1" ;;
+    esac
+}
+
+# 配置是数据：格式不对直接指出行号退出（严格度与 llm_probe.py 对齐）
+validate_config() {
+    bad=$(awk '
+        { line = $0
+          sub(/^[ \t]+/, "", line)
+          sub(/[ \t]+$/, "", line)
+          if (line == "" || line ~ /^#/) next
+          if (index(line, "=") == 0) { printf("%d: 不是 KEY=VALUE", NR); exit }
+          if (substr(line, 1, 1) == "=") { printf("%d: KEY 为空", NR); exit }
+        }' "$CONFIG") || true
+    [ -z "$bad" ] || die "配置文件格式错误（第 $bad 行）: $CONFIG"
+}
+
 load_config() {
-    [ -f "$CONFIG" ] || return 0
-    # 环境变量优先，配置文件只兜底（和 llm_probe.py 的优先级一致）
-    if [ -z "${LLM_BASE_URL:-}" ]; then
-        BASE_URL=$(strip_quotes "$(cfg_get LLM_BASE_URL)")
-    else
-        BASE_URL=$LLM_BASE_URL
+    # 注意：配置文件不存在时只是"没东西可读"，默认值与校验仍要往下走
+    # （setkey 首次创建配置的场景正好会走到这里）。
+    if [ -f "$CONFIG" ]; then
+        validate_config
+        # 优先级：命令行 > 环境变量 > 配置文件。
+        # 命令行值在 main() 里于本函数**之后**套用，这里对已有的非空值保持不动，
+        # 避免"谁最后赋值谁赢"这种隐式顺序依赖。
+        if [ -z "${LLM_BASE_URL:-}" ]; then
+            BASE_URL=$(strip_quotes "$(cfg_get LLM_BASE_URL)")
+        else
+            BASE_URL=$LLM_BASE_URL
+        fi
+        if [ -z "${LLM_MODEL:-}" ]; then
+            MODEL=$(strip_quotes "$(cfg_get LLM_MODEL)")
+        else
+            MODEL=$LLM_MODEL
+        fi
+        [ -n "$TIMEOUT" ] || TIMEOUT="${LLM_TIMEOUT:-$(strip_quotes "$(cfg_get LLM_TIMEOUT)")}"
+        [ -n "$PROMPT" ] || PROMPT="${LLM_PROMPT:-$(strip_quotes "$(cfg_get LLM_PROMPT)")}"
+        [ -n "$MAX_TOKENS" ] || MAX_TOKENS="${LLM_MAX_TOKENS:-$(strip_quotes "$(cfg_get LLM_MAX_TOKENS)")}"
+        PASSPHRASE_FILE="${LLM_PASSPHRASE_FILE:-$(strip_quotes "$(cfg_get LLM_PASSPHRASE_FILE)")}"
+        [ -n "$PASSPHRASE_FILE" ] && PASSPHRASE_FILE=$(expand_tilde "$PASSPHRASE_FILE")
+        API_KEY_ENC="${LLM_API_KEY_ENC:-$(strip_quotes "$(cfg_get LLM_API_KEY_ENC)")}"
+        API_KEY_PLAIN="${LLM_API_KEY:-$(strip_quotes "$(cfg_get LLM_API_KEY)")}"
     fi
-    if [ -z "${LLM_MODEL:-}" ]; then
-        MODEL=$(strip_quotes "$(cfg_get LLM_MODEL)")
-    else
-        MODEL=$LLM_MODEL
-    fi
-    TIMEOUT="${LLM_TIMEOUT:-$(strip_quotes "$(cfg_get LLM_TIMEOUT)")}"
-    PROMPT="${LLM_PROMPT:-$(strip_quotes "$(cfg_get LLM_PROMPT)")}"
-    MAX_TOKENS="${LLM_MAX_TOKENS:-$(strip_quotes "$(cfg_get LLM_MAX_TOKENS)")}"
-    PASSPHRASE_FILE="${LLM_PASSPHRASE_FILE:-$(strip_quotes "$(cfg_get LLM_PASSPHRASE_FILE)")}"
-    API_KEY_ENC="${LLM_API_KEY_ENC:-$(cfg_get LLM_API_KEY_ENC)}"
-    API_KEY_PLAIN="${LLM_API_KEY:-$(cfg_get LLM_API_KEY)}"
 
     [ -n "$TIMEOUT" ] || TIMEOUT=30
     [ -n "$PROMPT" ] || PROMPT="你好"
     [ -n "$MAX_TOKENS" ] || MAX_TOKENS=64
+    validate_options
+}
+
+# 数值校验：curl 拿到 "--max-time abc" 只会含糊报错，这里给明确原因。
+# 注意不能只写 awk '$1 > 0'：非数字字段（如 abc）与数字比较会走**字符串**
+# 比较，"abc" > "0" 为真，会漏放；所以先 case 卡字符类，再做数值比较。
+# 这个函数必须在"命令行参数已套用"之后调用（main 里会再调一次），否则
+# --timeout abc / --max-tokens 0 这类 CLI 值会绕过检查。
+validate_options() {
+    case $TIMEOUT in
+        ''|*[!0-9.]*|*.*.*) die "配置错误：LLM_TIMEOUT / --timeout 必须是数字，当前 '$TIMEOUT'" ;;
+    esac
+    printf '%s' "$TIMEOUT" | awk '{ exit !(($1 + 0) > 0) }' \
+        || die "配置错误：LLM_TIMEOUT / --timeout 必须大于 0，当前 '$TIMEOUT'"
+    case $MAX_TOKENS in
+        ''|*[!0-9]*) die "配置错误：LLM_MAX_TOKENS / --max-tokens 必须是正整数，当前 '$MAX_TOKENS'" ;;
+    esac
+    printf '%s' "$MAX_TOKENS" | awk '{ exit !(($1 + 0) > 0) }' \
+        || die "配置错误：LLM_MAX_TOKENS / --max-tokens 必须大于 0，当前 '$MAX_TOKENS'"
 }
 
 write_template() { # $1 = 目标文件
@@ -334,6 +391,7 @@ mask_key() {
 resolve_key() {
     if [ -n "$KEY" ]; then
         warn_secret_arg "--key"
+        unset LLM_API_KEY     # --key 已给定，环境里那份多余：同样摘掉
         KEY_SOURCE="--key 参数"
         return 0
     fi
@@ -471,8 +529,10 @@ probe_infer() {  # L3: POST /chat/completions
     case $code in
         200)
             content=$(extract_content)
+            usage=$(extract_usage)
+            [ -n "$usage" ] || usage="?/?"     # 与 llm_probe.py 的文案形状保持一致
             STEP3_OK=1; STEP3_KIND=""
-            STEP3_DETAIL="HTTP 200 (${ms}ms)"
+            STEP3_DETAIL="HTTP 200 (${ms}ms) model=$MODEL tokens=$usage"
             STEP3_CONTENT=$content ;;
         401|403) STEP3_OK=0; STEP3_KIND="auth";      STEP3_DETAIL="HTTP $code：${msg:-密钥无效}" ;;
         404)     STEP3_OK=0; STEP3_KIND="notfound";  STEP3_DETAIL="HTTP 404：${msg:-路径不对}" ;;
@@ -536,6 +596,14 @@ extract_content() {
     json_unescape "$raw"
 }
 
+extract_usage() {  # 输出 "prompt/completion"（如 7/11）；响应里没有 usage 就输出空
+    p=$(sed -n 's/.*"prompt_tokens"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$BODY_FILE" 2>/dev/null | head -n 1)
+    c=$(sed -n 's/.*"completion_tokens"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$BODY_FILE" 2>/dev/null | head -n 1)
+    if [ -n "$p" ] && [ -n "$c" ]; then
+        printf '%s/%s' "$p" "$c"
+    fi
+}
+
 ms_of() {  # 秒 → 毫秒（一位小数）
     awk -v s="$1" 'BEGIN{printf "%.1f", s*1000}'
 }
@@ -555,6 +623,7 @@ run_probe() {
     # 密钥按需解析：--only net 只测网络，不该被“拿不到解密口令”卡住
     if [ "$ONLY" = "net" ]; then
         KEY=""
+        unset LLM_API_KEY   # 这条路径不读密钥，但环境里那份仍不能给子进程
         KEY_SOURCE="未读取（--only net 不需要密钥）"
     else
         resolve_key
@@ -701,30 +770,31 @@ do_setkey() {
     load_config
     [ -n "$KEY" ] && warn_secret_arg "--key"
     new_key=$KEY
+    if [ -z "$new_key" ] && [ -n "${LLM_API_KEY:-}" ]; then
+        new_key=$LLM_API_KEY
+    fi
+    # 选完就摘：来源是 --key 还是环境变量，都不留给子进程
+    unset LLM_API_KEY
     if [ -z "$new_key" ]; then
-        if [ -n "${LLM_API_KEY:-}" ]; then
-            new_key=$LLM_API_KEY
-            unset LLM_API_KEY        # 读到就摘：别让它跟着子进程走
-        elif [ -t 0 ]; then
+        if [ -t 0 ]; then
             printf 'API Key: ' >&2
             stty -echo 2>/dev/null || true
             read -r new_key
             stty echo 2>/dev/null || true
             printf '\n' >&2
         else
-            # 非交互：优先从 stdin 读（管道内容不进 argv、不进 shell 历史）
-            if IFS= read -r new_key; then
-                new_key=$(printf '%s' "$new_key" | head -n 1)
-            else
-                new_key=""
-            fi
+            # 非交互：从 stdin 读（管道内容不进 argv、不进 shell 历史）。
+            # 注意 `printf '%s' "$KEY" | setkey` 没有尾换行，read 会返回非 0
+            # 但变量其实已经拿到了——不能只看 read 的返回值。
+            new_key=""
+            IFS= read -r new_key || true
+            new_key=$(printf '%s' "$new_key" | head -n 1)
             [ -n "$new_key" ] || die "拿不到密钥。非交互环境建议从管道读:
   printf '%s' \"\$KEY\" | $PROG setkey
 （或用 LLM_API_KEY 环境变量；--key 会留在 shell 历史和 ps 进程列表里）"
         fi
     fi
     [ -n "$new_key" ] || die "密钥为空"
-    PASSPHRASE_FILE="${LLM_PASSPHRASE_FILE:-$(strip_quotes "$(cfg_get LLM_PASSPHRASE_FILE)")}"
     require_openssl
     need_passphrase confirm
     token=$(printf '%s' "$new_key" | encrypt_key)
@@ -743,7 +813,6 @@ do_showkey() {
     [ -f "$CONFIG" ] || die "配置文件不存在: $CONFIG"
     load_config
     if [ -n "$API_KEY_ENC" ]; then
-        PASSPHRASE_FILE="${LLM_PASSPHRASE_FILE:-$(strip_quotes "$(cfg_get LLM_PASSPHRASE_FILE)")}"
         require_openssl
         need_passphrase ""
         if ! plain=$(decrypt_key "$API_KEY_ENC"); then
@@ -762,8 +831,8 @@ do_showkey() {
 do_env() {
     [ -f "$CONFIG" ] || die "配置文件不存在: $CONFIG"
     load_config
+    [ -n "$KEY" ] && warn_secret_arg "--key"
     if [ -n "$API_KEY_ENC" ]; then
-        PASSPHRASE_FILE="${LLM_PASSPHRASE_FILE:-$(strip_quotes "$(cfg_get LLM_PASSPHRASE_FILE)")}"
         if [ -n "${LLM_PASSPHRASE:-}" ] || [ -n "$PASSPHRASE_ARG" ] \
             || [ -n "${PASSPHRASE_FILE:-}" ] || [ -t 0 ]; then
             require_openssl
@@ -838,6 +907,7 @@ main() {
     [ -n "$PROMPT_ARG" ] && PROMPT=$PROMPT_ARG
     [ -n "$TIMEOUT_ARG" ] && TIMEOUT=$TIMEOUT_ARG
     [ -n "$MAX_TOKENS_ARG" ] && MAX_TOKENS=$MAX_TOKENS_ARG
+    validate_options    # CLI 值是刚套用的，必须在这里再校验一次
 
     case $CMD in
         probe)   run_probe ;;

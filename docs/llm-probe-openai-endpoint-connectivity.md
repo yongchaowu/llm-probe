@@ -1,6 +1,6 @@
 ---
 title: LLM 端点连不上？把"不通"拆成四层来查：llm_probe 的 py + sh 双实现
-description: 从一次 401 无效的令牌说起，讲清楚 OpenAI 兼容端点要打通要过几关（DNS/TCP/TLS、/models 认证、/chat/completions 推理、openai 0.28 与 1.x 兼容），并给出零依赖 Python 与纯 curl 两个实现：退出码直接给结论，密钥用 openssl 加密后存进 env 配置文件，附 mock 服务跑出的 44 项断言。
+description: 从一次 401 无效的令牌说起，讲清楚 OpenAI 兼容端点要打通要过几关（DNS/TCP/TLS、/models 认证、/chat/completions 推理、openai 0.28 与 1.x 兼容），并给出零依赖 Python 与纯 curl 两个实现：退出码直接给结论，密钥用 openssl 加密后存进 env 配置文件，附 mock 服务跑出的 70 项断言。
 date: 2026-09-25
 tags: [Python, Shell, LLM, 网络诊断, 密钥安全, OpenAI, curl]
 lang: zh-CN
@@ -24,7 +24,7 @@ print(client.chat.completions.create(model="claude-opus-4-7",
 
 更糟的是第二类问题：key 明文躺在脚本里，脚本进了备份、进了网盘、贴进了聊天窗口，key 就等于公开了。
 
-这篇文章对应两个文件：`llm_probe.py`（974 行，纯标准库）和 `llm_probe.sh`（851 行，纯 `curl` + `openssl`）。它们做同一件事——**把"连不上"翻译成"哪一层连不上"**，用退出码直接给结论；并且把密钥加密存进一份 env 配置文件，两个实现互认对方写的密文。
+这篇文章对应两个文件：`llm_probe.py`（1022 行，纯标准库）和 `llm_probe.sh`（921 行，纯 `curl` + `openssl`）。它们做同一件事——**把"连不上"翻译成"哪一层连不上"**，用退出码直接给结论；并且把密钥加密存进一份 env 配置文件，两个实现互认对方写的密文。
 
 完整代码在 GitHub：<https://github.com/yongchaowu/llm-probe>，本地位于 `~/Workspace/VibeCoding/llm-probe/`。仓库里还有一份"最简 demo"（`demo_minimal.py`，97 行），见第六节；本文附录收录了两份脚本的逐行源码。
 
@@ -188,7 +188,7 @@ fi
 
 ## 四、实测：用 mock 服务把分支跑干净
 
-**结论要可信，得先在自己能控制的环境里把所有分支跑一遍。** 于是写了个 ~100 行的 mock 服务（`MOCK_MODE` 切换行为），覆盖 15 组场景、44 项断言：
+**结论要可信，得先在自己能控制的环境里把所有分支跑一遍。** 于是写了个 ~110 行的 mock 服务（`MOCK_MODE` 切换 7 种行为），覆盖 16 组场景、70 项断言：
 
 | # | 场景 | 期望退出码 | py | sh |
 |---|---|---|---|---|
@@ -211,7 +211,8 @@ fi
 | 12 | `setkey` 走 stdin / 非交互无输入报错 | 1 | ✅ | ✅ |
 | 13 | 老 openssl（无 `-pbkdf2`）给出可读报错 | 1 | ✅ | ✅ |
 | 14 | 单元测试（配置解析 / 加解密 / 结论映射 / 密钥卫生） | — | ✅ | — |
-| 15 | py / sh 跨实现逐字段一致（6 种故障模式） | 0/2/3/4 | ✅ | ✅ |
+| 15 | py / sh 跨实现逐字段一致（6 种故障模式，含 L2/L3 detail） | 0/2/3/4 | ✅ | ✅ |
+| 16 | 自查发现的 12 类缺陷回归（退出码契约、0 值校验、畸形配置、双引号剥离、`~` 展开、`--only net` 泄漏、优先级上线验证） | 1 | ✅ | ✅ |
 
 全绿。**测试过程中挖出三个真 bug**，都是"写的时候觉得对、跑起来才露馅"的类型：
 
@@ -304,6 +305,8 @@ unset LLM_PASSPHRASE              # 同上；openssl 用 VAR=val cmd 只喂那�
 
 同理，`setkey` 不再要求 `--key`：非交互时**从 stdin 读**（`printf '%s' "$KEY" | ... setkey`），密钥既不进 argv 也不进历史；真用了 `--key` / `--passphrase`，两个实现都会在 stderr 打一行警告。
 
+补一个容易漏的边界：摘除不能只做在"读取密钥"这条路上。`--only net` 根本不读密钥，但环境里的 `LLM_API_KEY` 照样会被 curl 继承；选了 `--key` 时环境里那份 key 也已经多余。两种情况现在都会摘。
+
 拿不到口令时的行为要分情况：`--only net` 这种不需要密钥的探测**直接跳过解析**，不该被口令卡住；全量探测则明确报 `配置里是加密密钥，但拿不到解密口令` 并退出 1——**宁可拒绝，也不能默默降级成匿名请求然后给出"key 无效"的错误结论**。
 
 ### 配置文件不是脚本
@@ -315,6 +318,8 @@ cfg_get() {   # 用 sed 取值，不用 source
     sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONFIG" | tail -n 1
 }
 ```
+
+自己解析还带来三件 `source` 顺带给了、但并不想要的事：两个实现会一致地**剥掉一层配引号**、一致地**展开 `~`**，以及一致地**拒绝坏行**——空 KEY、非 `KEY=VALUE`、`LLM_TIMEOUT=abc` 都在解析阶段退 1 并指出行号，而不是让错误一路飘到 curl 再变成一句含糊的报错。
 
 原因很直白：`source` 一份配置等于执行任意命令。配置文件里写一行 `LLM_MODEL=$(rm -rf ~)` 或者 `$(touch /tmp/pwned)`，`source` 版本会照做，我们的版本只会把它当成字符串值。测试第 10 组专门验证了这一点（配置里埋 `$(touch ...)`，断言文件没被创建）。
 
@@ -333,7 +338,7 @@ client = OpenAI(base_url="https://aiapiv2.pekpik.com/v1",
 
 ## 六、只想要一个最简 demo
 
-分层探测是排障工具，不是入门材料。如果你只是想**先跑通一次调用**、看看端点到底能不能用，那 974 行的 `llm_probe.py` 显得太重了——所以仓库里另放了一个 `demo_minimal.py`，97 行、只有两个函数和一个入口，只做一件事：发一条消息，打印回复。
+分层探测是排障工具，不是入门材料。如果你只是想**先跑通一次调用**、看看端点到底能不能用，那 1022 行的 `llm_probe.py` 显得太重了——所以仓库里另放了一个 `demo_minimal.py`，97 行、只有两个函数和一个入口，只做一件事：发一条消息，打印回复。
 
 核心调用就这么几行：
 
@@ -457,7 +462,7 @@ if __name__ == "__main__":
 | 输出 | 只有回复文本 | 分层报告 + 结论 + 退出码 |
 | 失败时 | 三档粗分类（2/3/4） | 六档（0–5），能区分 400/404/429/5xx |
 | 依赖 | openai SDK | 零第三方依赖（`--sdk` 才需要） |
-| 体量 | 97 行 | 974 行 / 851 行 |
+| 体量 | 97 行 | 1022 行 / 921 行 |
 
 **demo 跑通了不等于端点健康，demo 挂了也说不清原因**——所以它只是入口，结论仍以 `probe` 的退出码为准。反过来，`probe` 已经告诉你端点可用之后，真正在你的应用里要写的代码，就是上面那五行。
 
@@ -476,8 +481,11 @@ if __name__ == "__main__":
 | 分层 | 都是 L1/L2/L3，都是"L2 判死就跳过 L3，`--all` 强制" |
 | 404 语义 | 都把 `/models` 的 404 标成非致命 |
 | `--json` | 字段集合一致（含 `config`），`L3 推理` 恒带 `skipped` |
+| 报告文案 | L2/L3 的 detail 逐字一致（耗时归一化后比对） |
 
-差异只有两处，且都写在明面上：shell 版**没有 L4 SDK 层**（`--only sdk` 会提示改用 py 版），以及 `\uXXXX` 解码依赖 python3（可选增强）。
+有意保留的差异只有三处，都写在明面上：shell 版**没有 L4 SDK 层**（`--only sdk` 会提示改用 py 版）；`\uXXXX` 解码依赖 python3（可选增强）；L1 报告内容不同——py 能报证书 CN 与有效期，curl 拿不到证书链，就改为报 `remote_ip` 与连接/握手耗时拆分。
+
+另外两条"隐形契约"也用测试钉死了：**优先级只有一条**（命令行 > 环境变量 > 配置文件，两端都验到服务端收到的 `max_tokens`），以及**退出码不许被占用**——`2` 永远表示网络不通，所以 argparse 的参数错误（默认退 2）被改成退 1，否则 CI 里一个拼错的参数会被误判成网络故障。
 
 一致性靠测试钉住：同一组 mock 场景跑两遍，**退出码、每个步骤的 `ok`/`skipped`、结论文字、JSON 字段集合逐项比对**，密文互写互读各测一次。**"应该是一样的"不算数，跑过才算。**
 
@@ -516,13 +524,13 @@ if __name__ == "__main__":
 - **退出码是主要接口**，人看报告、脚本看 `$?`，两者共用同一套结论。
 - **404 要区分语义**：`/models` 404 是"这站不支持枚举"（非致命），`/chat/completions` 404 是"路径写错了"（致命）。
 - **密钥加密的核心不是算法，是格式对齐**：让 Python 和 openssl 产出同一种字节，互通就是免费的；口令单独保管、配置文件永远不被 `source`。
-- **测试要造自己的对照组**：mock 服务把 15 组分支跑干净，才敢说"这 44 项都对"；也才有机会抓到子 shell 丢赋值、`\uXXXX` 转义、argparse 覆盖这三个不跑就发现不了的 bug。
+- **测试要造自己的对照组**：mock 服务把 16 组分支跑干净，才敢说"这 70 项都对"；也才有机会抓到子 shell 丢赋值、`\uXXXX` 转义、argparse 覆盖这三个不跑就发现不了的 bug。
 
 ---
 
 ## 附录：完整源码
 
-### A. `llm_probe.py`（974 行，Python 3.7+，零第三方依赖）
+### A. `llm_probe.py`（1022 行，Python 3.7+，零第三方依赖）
 
 ```python
 #!/usr/bin/env python3
@@ -642,6 +650,18 @@ def parse_env_file(path):
                 value = value[1:-1]
             data[key] = value
     return data
+
+
+def read_config(path):
+    """读配置；格式错误变成人话 + 退出码 1，而不是甩一个 traceback。"""
+    try:
+        return parse_env_file(path)
+    except ValueError as exc:
+        print(f"配置文件格式错误: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    except OSError as exc:
+        print(f"读不了配置文件 {path}: {exc}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 def update_env_file(path, updates):
@@ -1193,13 +1213,14 @@ def cmd_probe(args):
     config_path = os.path.expanduser(args.config)
     cfg = {}
     if os.path.exists(config_path):
-        cfg = parse_env_file(config_path)
+        cfg = read_config(config_path)
     elif args.config != DEFAULT_CONFIG:
         print(f"配置文件不存在: {config_path}", file=sys.stderr)
         return 1
 
-    base_url = args.base_url or cfg.get("LLM_BASE_URL") or os.environ.get("LLM_BASE_URL")
-    model = args.model or cfg.get("LLM_MODEL") or os.environ.get("LLM_MODEL")
+    # 优先级：命令行 > 环境变量 > 配置文件（与 llm_probe.sh 一致）
+    base_url = args.base_url or os.environ.get("LLM_BASE_URL") or cfg.get("LLM_BASE_URL")
+    model = args.model or os.environ.get("LLM_MODEL") or cfg.get("LLM_MODEL")
     if not base_url:
         print("缺少 base_url：用 --base-url 或在配置里填 LLM_BASE_URL", file=sys.stderr)
         return 1
@@ -1210,12 +1231,30 @@ def cmd_probe(args):
         print(f"base_url 非法（需要 http(s)://host[/v1]）: {base_url}", file=sys.stderr)
         return 1
 
-    timeout = float(args.timeout or cfg.get("LLM_TIMEOUT") or 30)
-    prompt = args.prompt or cfg.get("LLM_PROMPT") or "你好"
-    max_tokens = int(args.max_tokens or cfg.get("LLM_MAX_TOKENS") or 64)
+    prompt = args.prompt or os.environ.get("LLM_PROMPT") or cfg.get("LLM_PROMPT") or "你好"
+    # 注意不能用 `args.x or ...`：显式传 0 会被当成"没传"而绕过下面的校验
+    # （--timeout 0 / --max-tokens 0 必须报"必须大于 0"，而不是悄悄用默认值）
+    timeout_raw = (args.timeout if args.timeout is not None
+                   else os.environ.get("LLM_TIMEOUT") or cfg.get("LLM_TIMEOUT") or 30)
+    tokens_raw = (args.max_tokens if args.max_tokens is not None
+                  else os.environ.get("LLM_MAX_TOKENS") or cfg.get("LLM_MAX_TOKENS") or 64)
+    try:
+        timeout = float(timeout_raw)
+        max_tokens = int(tokens_raw)
+    except (TypeError, ValueError):
+        print("配置错误：timeout 必须是数字（如 30、2.5），max-tokens 必须是整数",
+              file=sys.stderr)
+        return 1
+    if timeout <= 0 or max_tokens <= 0:
+        print("配置错误：timeout 与 max-tokens 必须大于 0", file=sys.stderr)
+        return 1
 
-    key, key_source = resolve_key(args, cfg) if args.only != "net" else (
-        None, "未读取（--only net 不需要密钥）")
+    if args.only == "net":
+        # 不用密钥，但环境里那份也不能留给子进程（与 sh 一致）
+        scrub_env("LLM_API_KEY")
+        key, key_source = None, "未读取（--only net 不需要密钥）"
+    else:
+        key, key_source = resolve_key(args, cfg)
 
     # L1 是裸 socket，天然不走代理；--direct 让 L2/L3 也绕开代理，保持口径一致
     if args.direct:
@@ -1268,6 +1307,8 @@ def resolve_key(args, cfg):
     """密钥优先级：--key > LLM_API_KEY 环境变量 > 解密 LLM_API_KEY_ENC > LLM_API_KEY 明文。"""
     if getattr(args, "key", None):
         warn_secret_arg("--key")
+        # --key 已经给定，环境里那份就多余了：同样摘掉，别让子进程继承
+        scrub_env("LLM_API_KEY")
         return args.key, "--key 参数"
     if os.environ.get("LLM_API_KEY"):
         value = os.environ["LLM_API_KEY"]
@@ -1302,14 +1343,15 @@ def cmd_setkey(args):
     if not os.path.exists(config_path):
         if init_config(config_path):
             return 1
-    cfg = parse_env_file(config_path)
+    cfg = read_config(config_path)
     if getattr(args, "key", None):
         warn_secret_arg("--key")
         key = args.key
     else:
         key = os.environ.get("LLM_API_KEY")
-        if key:
-            scrub_env("LLM_API_KEY")   # 读到就摘：别让它跟着子进程走
+    if key:
+        # 选完就摘：来源是 --key 还是环境变量，都不留给子进程
+        scrub_env("LLM_API_KEY")
     if not key:
         if sys.stdin.isatty():
             import getpass
@@ -1347,7 +1389,7 @@ def cmd_setkey(args):
 
 
 def cmd_showkey(args):
-    cfg = parse_env_file(os.path.expanduser(args.config))
+    cfg = read_config(os.path.expanduser(args.config))
     token = cfg.get("LLM_API_KEY_ENC")
     if not token:
         plain = cfg.get("LLM_API_KEY")
@@ -1370,7 +1412,7 @@ def cmd_showkey(args):
 
 
 def cmd_env(args):
-    cfg = parse_env_file(os.path.expanduser(args.config))
+    cfg = read_config(os.path.expanduser(args.config))
     try:
         key, source = resolve_key(args, cfg)
     except SystemExit as exc:
@@ -1386,6 +1428,19 @@ def cmd_env(args):
     return 0
 
 
+class _ArgumentParser(argparse.ArgumentParser):
+    """参数/用法错误一律退出 1。
+
+    argparse 默认退出 2，而本工具的 2 = 网络不通；CI 里按退出码分诊的话，
+    一个拼错的参数会被误判成网络故障。
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"参数错误: {message}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def build_parser():
     # 公共选项放在 parent 里，主命令和所有子命令都能用，且带 SUPPRESS，
     # 这样 `llm_probe.py -c x probe` 和 `llm_probe.py probe -c x` 都不互相覆盖。
@@ -1393,7 +1448,8 @@ def build_parser():
     common.add_argument("-c", "--config", default=argparse.SUPPRESS, metavar="FILE",
                         help=f"配置文件 (默认: {DEFAULT_CONFIG})")
 
-    parser = argparse.ArgumentParser(
+    # 子命令 parser 会自动沿用这个类（add_subparsers 默认 parser_class=type(self)）
+    parser = _ArgumentParser(
         prog="llm_probe.py",
         parents=[common],
         description="OpenAI 兼容 LLM 端点连通性探测（网络/认证/推理/SDK 分层检查，密钥加密存储）。",
@@ -1500,7 +1556,8 @@ def main(argv=None):
 if __name__ == "__main__":
     sys.exit(main())
 ```
-### B. `llm_probe.sh`（851 行，POSIX sh，依赖 curl + openssl，OpenSSL ≥ 1.1.1）
+
+### B. `llm_probe.sh`（921 行，POSIX sh，依赖 curl + openssl，OpenSSL ≥ 1.1.1）
 
 ```bash
 #!/bin/sh
@@ -1589,7 +1646,13 @@ cleanup() {
     [ -n "$BODY_FILE" ] && rm -f "$BODY_FILE"
     [ -n "$ERR_FILE" ] && rm -f "$ERR_FILE"
 }
-trap cleanup EXIT INT TERM HUP QUIT
+# 收到信号要"清干净 + 立刻退出"：只 cleanup 不 exit 的话，脚本会从被打断的
+# 那一行继续往下跑，Ctrl-C 之后还可能打出一份半截报告。
+trap cleanup EXIT
+trap 'cleanup; trap - INT; exit 130' INT
+trap 'cleanup; trap - TERM; exit 143' TERM
+trap 'cleanup; trap - HUP; exit 129' HUP
+trap 'cleanup; trap - QUIT; exit 131' QUIT
 
 # 临时响应体集中放在一个私有目录里（umask 077 → 0700），退出即删。
 # 注意：kill -9 / SIGKILL 不触发 trap，目录会残留；下次运行是新建目录，不会
@@ -1656,36 +1719,87 @@ cfg_get() {  # $1 = 变量名；取配置文件里最后一次出现的值
 }
 
 strip_quotes() {
+    # 模式必须写 \"*（转义的双引号 + 任意），不能写 '"'"'"*：
+    # 后者是转义搞坏的产物，实际匹配的是"单引号+双引号"，于是所有双引号
+    # 包裹的值（LLM_BASE_URL="..."）都原样带着引号往下走。
     case $1 in
-        '"'"'"*) printf '%s' "$1" | sed 's/^"//; s/"$//' ;;
-        "'"*)    printf '%s' "$1" | sed "s/^'//; s/'\$//" ;;
-        *)       printf '%s' "$1" ;;
+        \"*)  printf '%s' "$1" | sed 's/^"//; s/"$//' ;;
+        "'"*) printf '%s' "$1" | sed "s/^'//; s/'\$//" ;;
+        *)    printf '%s' "$1" ;;
     esac
 }
 
+expand_tilde() {  # $1 = 路径；补上 shell 不会做的一步（变量里的 ~ 不展开）
+    case $1 in
+        '~')      printf '%s' "$HOME" ;;
+        '~/'*)    _rest=${1#?}                 # 去掉开头的 ~
+                  printf '%s' "$HOME/${_rest#/}" ;;
+        *)        printf '%s' "$1" ;;
+    esac
+}
+
+# 配置是数据：格式不对直接指出行号退出（严格度与 llm_probe.py 对齐）
+validate_config() {
+    bad=$(awk '
+        { line = $0
+          sub(/^[ \t]+/, "", line)
+          sub(/[ \t]+$/, "", line)
+          if (line == "" || line ~ /^#/) next
+          if (index(line, "=") == 0) { printf("%d: 不是 KEY=VALUE", NR); exit }
+          if (substr(line, 1, 1) == "=") { printf("%d: KEY 为空", NR); exit }
+        }' "$CONFIG") || true
+    [ -z "$bad" ] || die "配置文件格式错误（第 $bad 行）: $CONFIG"
+}
+
 load_config() {
-    [ -f "$CONFIG" ] || return 0
-    # 环境变量优先，配置文件只兜底（和 llm_probe.py 的优先级一致）
-    if [ -z "${LLM_BASE_URL:-}" ]; then
-        BASE_URL=$(strip_quotes "$(cfg_get LLM_BASE_URL)")
-    else
-        BASE_URL=$LLM_BASE_URL
+    # 注意：配置文件不存在时只是"没东西可读"，默认值与校验仍要往下走
+    # （setkey 首次创建配置的场景正好会走到这里）。
+    if [ -f "$CONFIG" ]; then
+        validate_config
+        # 优先级：命令行 > 环境变量 > 配置文件。
+        # 命令行值在 main() 里于本函数**之后**套用，这里对已有的非空值保持不动，
+        # 避免"谁最后赋值谁赢"这种隐式顺序依赖。
+        if [ -z "${LLM_BASE_URL:-}" ]; then
+            BASE_URL=$(strip_quotes "$(cfg_get LLM_BASE_URL)")
+        else
+            BASE_URL=$LLM_BASE_URL
+        fi
+        if [ -z "${LLM_MODEL:-}" ]; then
+            MODEL=$(strip_quotes "$(cfg_get LLM_MODEL)")
+        else
+            MODEL=$LLM_MODEL
+        fi
+        [ -n "$TIMEOUT" ] || TIMEOUT="${LLM_TIMEOUT:-$(strip_quotes "$(cfg_get LLM_TIMEOUT)")}"
+        [ -n "$PROMPT" ] || PROMPT="${LLM_PROMPT:-$(strip_quotes "$(cfg_get LLM_PROMPT)")}"
+        [ -n "$MAX_TOKENS" ] || MAX_TOKENS="${LLM_MAX_TOKENS:-$(strip_quotes "$(cfg_get LLM_MAX_TOKENS)")}"
+        PASSPHRASE_FILE="${LLM_PASSPHRASE_FILE:-$(strip_quotes "$(cfg_get LLM_PASSPHRASE_FILE)")}"
+        [ -n "$PASSPHRASE_FILE" ] && PASSPHRASE_FILE=$(expand_tilde "$PASSPHRASE_FILE")
+        API_KEY_ENC="${LLM_API_KEY_ENC:-$(strip_quotes "$(cfg_get LLM_API_KEY_ENC)")}"
+        API_KEY_PLAIN="${LLM_API_KEY:-$(strip_quotes "$(cfg_get LLM_API_KEY)")}"
     fi
-    if [ -z "${LLM_MODEL:-}" ]; then
-        MODEL=$(strip_quotes "$(cfg_get LLM_MODEL)")
-    else
-        MODEL=$LLM_MODEL
-    fi
-    TIMEOUT="${LLM_TIMEOUT:-$(strip_quotes "$(cfg_get LLM_TIMEOUT)")}"
-    PROMPT="${LLM_PROMPT:-$(strip_quotes "$(cfg_get LLM_PROMPT)")}"
-    MAX_TOKENS="${LLM_MAX_TOKENS:-$(strip_quotes "$(cfg_get LLM_MAX_TOKENS)")}"
-    PASSPHRASE_FILE="${LLM_PASSPHRASE_FILE:-$(strip_quotes "$(cfg_get LLM_PASSPHRASE_FILE)")}"
-    API_KEY_ENC="${LLM_API_KEY_ENC:-$(cfg_get LLM_API_KEY_ENC)}"
-    API_KEY_PLAIN="${LLM_API_KEY:-$(cfg_get LLM_API_KEY)}"
 
     [ -n "$TIMEOUT" ] || TIMEOUT=30
     [ -n "$PROMPT" ] || PROMPT="你好"
     [ -n "$MAX_TOKENS" ] || MAX_TOKENS=64
+    validate_options
+}
+
+# 数值校验：curl 拿到 "--max-time abc" 只会含糊报错，这里给明确原因。
+# 注意不能只写 awk '$1 > 0'：非数字字段（如 abc）与数字比较会走**字符串**
+# 比较，"abc" > "0" 为真，会漏放；所以先 case 卡字符类，再做数值比较。
+# 这个函数必须在"命令行参数已套用"之后调用（main 里会再调一次），否则
+# --timeout abc / --max-tokens 0 这类 CLI 值会绕过检查。
+validate_options() {
+    case $TIMEOUT in
+        ''|*[!0-9.]*|*.*.*) die "配置错误：LLM_TIMEOUT / --timeout 必须是数字，当前 '$TIMEOUT'" ;;
+    esac
+    printf '%s' "$TIMEOUT" | awk '{ exit !(($1 + 0) > 0) }' \
+        || die "配置错误：LLM_TIMEOUT / --timeout 必须大于 0，当前 '$TIMEOUT'"
+    case $MAX_TOKENS in
+        ''|*[!0-9]*) die "配置错误：LLM_MAX_TOKENS / --max-tokens 必须是正整数，当前 '$MAX_TOKENS'" ;;
+    esac
+    printf '%s' "$MAX_TOKENS" | awk '{ exit !(($1 + 0) > 0) }' \
+        || die "配置错误：LLM_MAX_TOKENS / --max-tokens 必须大于 0，当前 '$MAX_TOKENS'"
 }
 
 write_template() { # $1 = 目标文件
@@ -1839,6 +1953,7 @@ mask_key() {
 resolve_key() {
     if [ -n "$KEY" ]; then
         warn_secret_arg "--key"
+        unset LLM_API_KEY     # --key 已给定，环境里那份多余：同样摘掉
         KEY_SOURCE="--key 参数"
         return 0
     fi
@@ -1976,8 +2091,10 @@ probe_infer() {  # L3: POST /chat/completions
     case $code in
         200)
             content=$(extract_content)
+            usage=$(extract_usage)
+            [ -n "$usage" ] || usage="?/?"     # 与 llm_probe.py 的文案形状保持一致
             STEP3_OK=1; STEP3_KIND=""
-            STEP3_DETAIL="HTTP 200 (${ms}ms)"
+            STEP3_DETAIL="HTTP 200 (${ms}ms) model=$MODEL tokens=$usage"
             STEP3_CONTENT=$content ;;
         401|403) STEP3_OK=0; STEP3_KIND="auth";      STEP3_DETAIL="HTTP $code：${msg:-密钥无效}" ;;
         404)     STEP3_OK=0; STEP3_KIND="notfound";  STEP3_DETAIL="HTTP 404：${msg:-路径不对}" ;;
@@ -2041,6 +2158,14 @@ extract_content() {
     json_unescape "$raw"
 }
 
+extract_usage() {  # 输出 "prompt/completion"（如 7/11）；响应里没有 usage 就输出空
+    p=$(sed -n 's/.*"prompt_tokens"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$BODY_FILE" 2>/dev/null | head -n 1)
+    c=$(sed -n 's/.*"completion_tokens"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$BODY_FILE" 2>/dev/null | head -n 1)
+    if [ -n "$p" ] && [ -n "$c" ]; then
+        printf '%s/%s' "$p" "$c"
+    fi
+}
+
 ms_of() {  # 秒 → 毫秒（一位小数）
     awk -v s="$1" 'BEGIN{printf "%.1f", s*1000}'
 }
@@ -2060,6 +2185,7 @@ run_probe() {
     # 密钥按需解析：--only net 只测网络，不该被“拿不到解密口令”卡住
     if [ "$ONLY" = "net" ]; then
         KEY=""
+        unset LLM_API_KEY   # 这条路径不读密钥，但环境里那份仍不能给子进程
         KEY_SOURCE="未读取（--only net 不需要密钥）"
     else
         resolve_key
@@ -2206,30 +2332,31 @@ do_setkey() {
     load_config
     [ -n "$KEY" ] && warn_secret_arg "--key"
     new_key=$KEY
+    if [ -z "$new_key" ] && [ -n "${LLM_API_KEY:-}" ]; then
+        new_key=$LLM_API_KEY
+    fi
+    # 选完就摘：来源是 --key 还是环境变量，都不留给子进程
+    unset LLM_API_KEY
     if [ -z "$new_key" ]; then
-        if [ -n "${LLM_API_KEY:-}" ]; then
-            new_key=$LLM_API_KEY
-            unset LLM_API_KEY        # 读到就摘：别让它跟着子进程走
-        elif [ -t 0 ]; then
+        if [ -t 0 ]; then
             printf 'API Key: ' >&2
             stty -echo 2>/dev/null || true
             read -r new_key
             stty echo 2>/dev/null || true
             printf '\n' >&2
         else
-            # 非交互：优先从 stdin 读（管道内容不进 argv、不进 shell 历史）
-            if IFS= read -r new_key; then
-                new_key=$(printf '%s' "$new_key" | head -n 1)
-            else
-                new_key=""
-            fi
+            # 非交互：从 stdin 读（管道内容不进 argv、不进 shell 历史）。
+            # 注意 `printf '%s' "$KEY" | setkey` 没有尾换行，read 会返回非 0
+            # 但变量其实已经拿到了——不能只看 read 的返回值。
+            new_key=""
+            IFS= read -r new_key || true
+            new_key=$(printf '%s' "$new_key" | head -n 1)
             [ -n "$new_key" ] || die "拿不到密钥。非交互环境建议从管道读:
   printf '%s' \"\$KEY\" | $PROG setkey
 （或用 LLM_API_KEY 环境变量；--key 会留在 shell 历史和 ps 进程列表里）"
         fi
     fi
     [ -n "$new_key" ] || die "密钥为空"
-    PASSPHRASE_FILE="${LLM_PASSPHRASE_FILE:-$(strip_quotes "$(cfg_get LLM_PASSPHRASE_FILE)")}"
     require_openssl
     need_passphrase confirm
     token=$(printf '%s' "$new_key" | encrypt_key)
@@ -2248,7 +2375,6 @@ do_showkey() {
     [ -f "$CONFIG" ] || die "配置文件不存在: $CONFIG"
     load_config
     if [ -n "$API_KEY_ENC" ]; then
-        PASSPHRASE_FILE="${LLM_PASSPHRASE_FILE:-$(strip_quotes "$(cfg_get LLM_PASSPHRASE_FILE)")}"
         require_openssl
         need_passphrase ""
         if ! plain=$(decrypt_key "$API_KEY_ENC"); then
@@ -2267,8 +2393,8 @@ do_showkey() {
 do_env() {
     [ -f "$CONFIG" ] || die "配置文件不存在: $CONFIG"
     load_config
+    [ -n "$KEY" ] && warn_secret_arg "--key"
     if [ -n "$API_KEY_ENC" ]; then
-        PASSPHRASE_FILE="${LLM_PASSPHRASE_FILE:-$(strip_quotes "$(cfg_get LLM_PASSPHRASE_FILE)")}"
         if [ -n "${LLM_PASSPHRASE:-}" ] || [ -n "$PASSPHRASE_ARG" ] \
             || [ -n "${PASSPHRASE_FILE:-}" ] || [ -t 0 ]; then
             require_openssl
@@ -2343,6 +2469,7 @@ main() {
     [ -n "$PROMPT_ARG" ] && PROMPT=$PROMPT_ARG
     [ -n "$TIMEOUT_ARG" ] && TIMEOUT=$TIMEOUT_ARG
     [ -n "$MAX_TOKENS_ARG" ] && MAX_TOKENS=$MAX_TOKENS_ARG
+    validate_options    # CLI 值是刚套用的，必须在这里再校验一次
 
     case $CMD in
         probe)   run_probe ;;
@@ -2355,6 +2482,7 @@ main() {
 
 main "$@"
 ```
+
 ### C. 配置文件模板 `llm_probe.env.example`（37 行）
 
 ```bash
@@ -2497,4 +2625,4 @@ if __name__ == "__main__":
         print(f"调用失败：{text}", file=sys.stderr)
         sys.exit(4)
 ```
-> 测试用的 mock 服务（`tests/mock_llm.py`，6 种模式：`ok / unauthorized / badpath / badmodel / ratelimit / noreduce`）和分支测试脚本（`tests/run_tests.sh`，15 组场景、44 项断言；另有 `tests/test_units.py` 单元测试）随代码一起放在 `~/Workspace/VibeCoding/llm-probe/tests/`，直接 `./tests/run_tests.sh` 即可复现第四节的全部结论（期望 `PASS=44 FAIL=0`，单元测试用 `python3 tests/test_units.py`）。测试刻意不读取真实配置的解密口令：前 8 组用 `--key` 显式传密钥，密文互通那组用临时配置配自己的口令。
+> 测试用的 mock 服务（`tests/mock_llm.py`，6 种模式：`ok / unauthorized / badpath / badmodel / ratelimit / noreduce`）和分支测试脚本（`tests/run_tests.sh`，16 组场景、70 项断言；另有 `tests/test_units.py` 的 22 项单元测试）随代码一起放在 `~/Workspace/VibeCoding/llm-probe/tests/`，直接 `./tests/run_tests.sh` 即可复现第四节的全部结论（期望 `PASS=70 FAIL=0`，单元测试用 `python3 tests/test_units.py`；`.github/workflows/test.yml` 会在每次 push/PR 上自动跑这两套用例）。测试刻意不读取真实配置的解密口令：前 8 组用 `--key` 显式传密钥，密文互通那组用临时配置配自己的口令。

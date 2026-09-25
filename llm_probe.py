@@ -117,6 +117,18 @@ def parse_env_file(path):
     return data
 
 
+def read_config(path):
+    """读配置；格式错误变成人话 + 退出码 1，而不是甩一个 traceback。"""
+    try:
+        return parse_env_file(path)
+    except ValueError as exc:
+        print(f"配置文件格式错误: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    except OSError as exc:
+        print(f"读不了配置文件 {path}: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def update_env_file(path, updates):
     """按行更新配置文件：已存在的 key 原地覆盖，缺失的追加，注释原样保留。"""
     lines = []
@@ -666,13 +678,14 @@ def cmd_probe(args):
     config_path = os.path.expanduser(args.config)
     cfg = {}
     if os.path.exists(config_path):
-        cfg = parse_env_file(config_path)
+        cfg = read_config(config_path)
     elif args.config != DEFAULT_CONFIG:
         print(f"配置文件不存在: {config_path}", file=sys.stderr)
         return 1
 
-    base_url = args.base_url or cfg.get("LLM_BASE_URL") or os.environ.get("LLM_BASE_URL")
-    model = args.model or cfg.get("LLM_MODEL") or os.environ.get("LLM_MODEL")
+    # 优先级：命令行 > 环境变量 > 配置文件（与 llm_probe.sh 一致）
+    base_url = args.base_url or os.environ.get("LLM_BASE_URL") or cfg.get("LLM_BASE_URL")
+    model = args.model or os.environ.get("LLM_MODEL") or cfg.get("LLM_MODEL")
     if not base_url:
         print("缺少 base_url：用 --base-url 或在配置里填 LLM_BASE_URL", file=sys.stderr)
         return 1
@@ -683,12 +696,30 @@ def cmd_probe(args):
         print(f"base_url 非法（需要 http(s)://host[/v1]）: {base_url}", file=sys.stderr)
         return 1
 
-    timeout = float(args.timeout or cfg.get("LLM_TIMEOUT") or 30)
-    prompt = args.prompt or cfg.get("LLM_PROMPT") or "你好"
-    max_tokens = int(args.max_tokens or cfg.get("LLM_MAX_TOKENS") or 64)
+    prompt = args.prompt or os.environ.get("LLM_PROMPT") or cfg.get("LLM_PROMPT") or "你好"
+    # 注意不能用 `args.x or ...`：显式传 0 会被当成"没传"而绕过下面的校验
+    # （--timeout 0 / --max-tokens 0 必须报"必须大于 0"，而不是悄悄用默认值）
+    timeout_raw = (args.timeout if args.timeout is not None
+                   else os.environ.get("LLM_TIMEOUT") or cfg.get("LLM_TIMEOUT") or 30)
+    tokens_raw = (args.max_tokens if args.max_tokens is not None
+                  else os.environ.get("LLM_MAX_TOKENS") or cfg.get("LLM_MAX_TOKENS") or 64)
+    try:
+        timeout = float(timeout_raw)
+        max_tokens = int(tokens_raw)
+    except (TypeError, ValueError):
+        print("配置错误：timeout 必须是数字（如 30、2.5），max-tokens 必须是整数",
+              file=sys.stderr)
+        return 1
+    if timeout <= 0 or max_tokens <= 0:
+        print("配置错误：timeout 与 max-tokens 必须大于 0", file=sys.stderr)
+        return 1
 
-    key, key_source = resolve_key(args, cfg) if args.only != "net" else (
-        None, "未读取（--only net 不需要密钥）")
+    if args.only == "net":
+        # 不用密钥，但环境里那份也不能留给子进程（与 sh 一致）
+        scrub_env("LLM_API_KEY")
+        key, key_source = None, "未读取（--only net 不需要密钥）"
+    else:
+        key, key_source = resolve_key(args, cfg)
 
     # L1 是裸 socket，天然不走代理；--direct 让 L2/L3 也绕开代理，保持口径一致
     if args.direct:
@@ -741,6 +772,8 @@ def resolve_key(args, cfg):
     """密钥优先级：--key > LLM_API_KEY 环境变量 > 解密 LLM_API_KEY_ENC > LLM_API_KEY 明文。"""
     if getattr(args, "key", None):
         warn_secret_arg("--key")
+        # --key 已经给定，环境里那份就多余了：同样摘掉，别让子进程继承
+        scrub_env("LLM_API_KEY")
         return args.key, "--key 参数"
     if os.environ.get("LLM_API_KEY"):
         value = os.environ["LLM_API_KEY"]
@@ -775,14 +808,15 @@ def cmd_setkey(args):
     if not os.path.exists(config_path):
         if init_config(config_path):
             return 1
-    cfg = parse_env_file(config_path)
+    cfg = read_config(config_path)
     if getattr(args, "key", None):
         warn_secret_arg("--key")
         key = args.key
     else:
         key = os.environ.get("LLM_API_KEY")
-        if key:
-            scrub_env("LLM_API_KEY")   # 读到就摘：别让它跟着子进程走
+    if key:
+        # 选完就摘：来源是 --key 还是环境变量，都不留给子进程
+        scrub_env("LLM_API_KEY")
     if not key:
         if sys.stdin.isatty():
             import getpass
@@ -820,7 +854,7 @@ def cmd_setkey(args):
 
 
 def cmd_showkey(args):
-    cfg = parse_env_file(os.path.expanduser(args.config))
+    cfg = read_config(os.path.expanduser(args.config))
     token = cfg.get("LLM_API_KEY_ENC")
     if not token:
         plain = cfg.get("LLM_API_KEY")
@@ -843,7 +877,7 @@ def cmd_showkey(args):
 
 
 def cmd_env(args):
-    cfg = parse_env_file(os.path.expanduser(args.config))
+    cfg = read_config(os.path.expanduser(args.config))
     try:
         key, source = resolve_key(args, cfg)
     except SystemExit as exc:
@@ -859,6 +893,19 @@ def cmd_env(args):
     return 0
 
 
+class _ArgumentParser(argparse.ArgumentParser):
+    """参数/用法错误一律退出 1。
+
+    argparse 默认退出 2，而本工具的 2 = 网络不通；CI 里按退出码分诊的话，
+    一个拼错的参数会被误判成网络故障。
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"参数错误: {message}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def build_parser():
     # 公共选项放在 parent 里，主命令和所有子命令都能用，且带 SUPPRESS，
     # 这样 `llm_probe.py -c x probe` 和 `llm_probe.py probe -c x` 都不互相覆盖。
@@ -866,7 +913,8 @@ def build_parser():
     common.add_argument("-c", "--config", default=argparse.SUPPRESS, metavar="FILE",
                         help=f"配置文件 (默认: {DEFAULT_CONFIG})")
 
-    parser = argparse.ArgumentParser(
+    # 子命令 parser 会自动沿用这个类（add_subparsers 默认 parser_class=type(self)）
+    parser = _ArgumentParser(
         prog="llm_probe.py",
         parents=[common],
         description="OpenAI 兼容 LLM 端点连通性探测（网络/认证/推理/SDK 分层检查，密钥加密存储）。",

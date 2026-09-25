@@ -13,7 +13,7 @@ metadata:
 
 | 脚本 | 路径 | 依赖 | 特点 |
 |---|---|---|---|
-| `llm_probe.py` | `~/Workspace/VibeCoding/llm-probe/llm_probe.py` | 仅 Python 标准库（3.7+） | 有 L4 SDK 层、`--json` 字段更全、TLS 证书信息 |
+| `llm_probe.py` | `~/Workspace/VibeCoding/llm-probe/llm_probe.py` | 仅 Python 标准库（3.7+） | 有 L4 SDK 层、`--json` 字段更全、TLS 证书信息（1022 行） |
 | `llm_probe.sh` | `~/Workspace/VibeCoding/llm-probe/llm_probe.sh` | `curl` + `openssl`（POSIX/dash 可跑） | 不依赖 Python；`\uXXXX` 解码有 python3 时自动启用 |
 | `demo_minimal.py` | `~/Workspace/VibeCoding/llm-probe/demo_minimal.py` | openai SDK | 97 行单次调用示例，**不用于诊断** |
 
@@ -49,7 +49,7 @@ python3 llm_probe.py probe --base-url https://api.openai.com/v1 --model gpt-4o-m
 
 只要"发一条消息看通不通"、不需要分层诊断时，用 `demo_minimal.py`（97 行，含 openai 0.28 / 1.x 两套写法）；**可用性结论仍以 `probe` 的退出码为准**。
 
-改过脚本之后跑回归：`./tests/run_tests.sh`，期望 `PASS=44 FAIL=0`（15 组场景，会短暂占用 18923 端口）；单元测试另跑 `python3 tests/test_units.py`。
+改过脚本之后跑回归：`./tests/run_tests.sh`，期望 `PASS=70 FAIL=0`（16 组场景，会短暂占用 18923 端口）；单元测试另跑 `python3 tests/test_units.py`（22 项）。CI（`.github/workflows/test.yml`）在每次 push/PR 上自动跑这两套。
 
 ## 分层与退出码（唯一权威判据）
 
@@ -95,6 +95,20 @@ python3 llm_probe.py showkey --plain       # 解密看明文（仅在用户明�
 | `HTTP 429 限流/额度耗尽` | 余额或限流 | 查余额、稍后重试 |
 | `认证跳过（/models 404）` | 中转站不实现 models | 属正常，以 L3 为准 |
 | `推理正常；认证通过` | 三件套可用 | 收工 |
+
+## 容易踩的坑（都是实测出来的）
+
+- **退出码 2 只能表示"网络不通"**。参数错误、配置畸形、`--timeout 0` 都要退 1 并说清原因；
+  改 argparse 时记得它默认退 2，会把 CI 的分诊带歪。
+- **配置里显式写 0 不会被当成"没传"**。写 `args.x or cfg.get(...)` 就会把 `--max-tokens 0`
+  悄悄换成默认值；要判断 `is not None`。
+- **摘除环境变量不能只做在"读密钥"那条路上**。`--only net` 不读密钥，但环境里的
+  `LLM_API_KEY` 照样会被 curl 继承；`--key` 给了以后环境里那份也多余。
+- **shell 的 case 模式别被转义搞坏**：写 `\"*`（转义双引号），别写 `'"'"'"*`
+  （那是转义事故，实际匹配"单引号+双引号"），否则所有双引号配置值都带着引号往下走。
+- **awk 拿非数字字段跟数字比较会走字符串比较**：`"abc" > "0"` 为真。校验要先用 `case`
+  卡字符类，再用 awk 比数值。
+- **`read` 遇到"有内容但没换行"的 EOF 会返回非 0**，但变量已经拿到了——不能只看返回值。
 
 ## 安全约束（务必遵守）
 

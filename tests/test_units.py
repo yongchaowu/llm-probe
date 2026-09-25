@@ -257,6 +257,98 @@ def test_missing_passphrase_message_recommends_file_first():
 
 
 # ---------------------------------------------------------------------------
+# 用户输入的错误必须变成"人话 + 退出码 1"，不能是 traceback，也不能占用 2
+# （2 在本工具里是"网络不通"）
+# ---------------------------------------------------------------------------
+def test_read_config_turns_bad_config_into_exit_one():
+    path = _tmp_env("LLM_MODEL 没有等号\n")
+    saved = sys.stderr
+    buf = io.StringIO()
+    try:
+        sys.stderr = buf
+        try:
+            llm_probe.read_config(path)
+        except SystemExit as exc:
+            assert exc.code == 1, exc.code
+        else:
+            raise AssertionError("畸形配置没有报错")
+    finally:
+        sys.stderr = saved
+        os.unlink(path)
+    assert "配置文件格式错误" in buf.getvalue(), buf.getvalue()
+
+
+def test_argparse_usage_error_exits_one():
+    """argparse 默认退出 2；不覆盖的话，CI 会把参数拼错当成网络故障。"""
+    for argv in (["probe", "--timeout", "abc"], ["probe", "--no-such-flag"]):
+        saved = sys.stderr
+        buf = io.StringIO()
+        try:
+            sys.stderr = buf
+            try:
+                llm_probe.build_parser().parse_args(argv)
+            except SystemExit as exc:
+                assert exc.code == 1, f"{argv} → 退出码 {exc.code}"
+            else:
+                raise AssertionError(f"{argv} 没有报错")
+        finally:
+            sys.stderr = saved
+
+
+def test_cmd_probe_rejects_non_positive_numbers():
+    """显式 0 不能被 `args.x or ...` 当成"没传"而绕过校验。"""
+    cfg = _tmp_env("LLM_BASE_URL=http://127.0.0.1:9/v1\nLLM_MODEL=m\n")
+    try:
+        for flag, value in (("--timeout", "0"), ("--max-tokens", "0"),
+                            ("--max-tokens", "-1")):
+            args = llm_probe.build_parser().parse_args(
+                ["probe", "-c", cfg, "--key", "sk-x", flag, value])
+            saved = sys.stderr
+            buf = io.StringIO()
+            try:
+                sys.stderr = buf
+                code = llm_probe.cmd_probe(args)
+            finally:
+                sys.stderr = saved
+            assert code == 1, f"{flag} {value} → 退出码 {code}"
+            assert "配置错误" in buf.getvalue(), buf.getvalue()
+        # 非数字由 argparse 在解析阶段就拒（同样退出 1，见上一个测试）
+        saved = sys.stderr
+        try:
+            sys.stderr = io.StringIO()
+            try:
+                llm_probe.build_parser().parse_args(
+                    ["probe", "-c", cfg, "--key", "sk-x", "--timeout", "abc"])
+            except SystemExit as exc:
+                assert exc.code == 1, exc.code
+            else:
+                raise AssertionError("--timeout abc 没有被拒")
+        finally:
+            sys.stderr = saved
+    finally:
+        os.unlink(cfg)
+
+
+def test_only_net_scrubs_api_key_env():
+    os.environ["LLM_API_KEY"] = "sk-env-net"
+    cfg = _tmp_env("LLM_BASE_URL=http://127.0.0.1:9/v1\nLLM_MODEL=m\n")
+    try:
+        args = llm_probe.build_parser().parse_args(
+            ["probe", "-c", cfg, "--only", "net"])
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                # 127.0.0.1:9 立刻拒绝，不产生外部流量；报告内容与本用例无关，吞掉
+                llm_probe.cmd_probe(args)
+        finally:
+            pass
+        assert "LLM_API_KEY" not in os.environ, "--only net 没摘环境变量"
+    finally:
+        os.unlink(cfg)
+        os.environ.pop("LLM_API_KEY", None)
+
+
+# ---------------------------------------------------------------------------
 # JSON 输出 schema（与 sh 端字段对齐）
 # ---------------------------------------------------------------------------
 def test_json_schema_parity():

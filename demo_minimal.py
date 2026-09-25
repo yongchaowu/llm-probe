@@ -20,23 +20,35 @@ import sys
 
 # 从同目录的 llm_probe 复用"读配置 + 解密"逻辑，避免在 demo 里重复造轮子
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from llm_probe import DEFAULT_CONFIG, decrypt_secret, parse_env_file  # noqa: E402
+from llm_probe import DEFAULT_CONFIG, decrypt_secret, parse_env_file, scrub_env  # noqa: E402
 
-BASE_URL = os.environ.get("LLM_BASE_URL") or "https://aiapiv2.pekpik.com/v1"
-MODEL = os.environ.get("LLM_MODEL") or "claude-opus-4-7"
+# 默认走官方端点；任何 OpenAI 兼容端点都可以（用 LLM_BASE_URL 覆盖）。
+# 本仓库 README 里的 aiapiv2.pekpik.com 只是第三方中转示例，别默认把密钥
+# 发给不认识的服务。
+BASE_URL = os.environ.get("LLM_BASE_URL") or "https://api.openai.com/v1"
+MODEL = os.environ.get("LLM_MODEL") or "gpt-4o-mini"
 
 
 def load_api_key():
-    """取密钥的三种来源，按优先级：环境变量 > 加密配置 > 明文配置。"""
+    """取密钥的三种来源，按优先级：环境变量 > 加密配置 > 明文配置。
+
+    拿到手就把环境变量里的密钥/口令摘掉（scrub_env）：环境变量会被后续每个
+    子进程无条件继承，包括 openai SDK 自己拉起来的那些。
+    """
     if os.environ.get("LLM_API_KEY"):                     # 1) 环境变量
-        return os.environ["LLM_API_KEY"]
+        value = os.environ["LLM_API_KEY"]
+        scrub_env("LLM_API_KEY")
+        return value
 
     cfg = parse_env_file(DEFAULT_CONFIG)
     token = cfg.get("LLM_API_KEY_ENC")                    # 2) 加密配置 enc:v1:...
     if token:
         passphrase = os.environ.get("LLM_PASSPHRASE")
         if not passphrase:
-            raise SystemExit("密钥是加密存储的，请先 export LLM_PASSPHRASE=...")
+            raise SystemExit(
+                "密钥是加密存储的。推荐先配置 LLM_PASSPHRASE_FILE 指向口令文件，"
+                "或临时 export LLM_PASSPHRASE=...（读到后会立即从环境里摘掉）")
+        os.environ.pop("LLM_PASSPHRASE", None)            # 读到就摘，别广播给子进程
         return decrypt_secret(token, passphrase)
 
     if cfg.get("LLM_API_KEY"):                            # 3) 明文配置（不推荐）

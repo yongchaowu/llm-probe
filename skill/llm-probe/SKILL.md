@@ -15,7 +15,7 @@ metadata:
 |---|---|---|---|
 | `llm_probe.py` | `~/Workspace/VibeCoding/llm-probe/llm_probe.py` | 仅 Python 标准库（3.7+） | 有 L4 SDK 层、`--json` 字段更全、TLS 证书信息 |
 | `llm_probe.sh` | `~/Workspace/VibeCoding/llm-probe/llm_probe.sh` | `curl` + `openssl`（POSIX/dash 可跑） | 不依赖 Python；`\uXXXX` 解码有 python3 时自动启用 |
-| `demo_minimal.py` | `~/Workspace/VibeCoding/llm-probe/demo_minimal.py` | openai SDK | 85 行单次调用示例，**不用于诊断** |
+| `demo_minimal.py` | `~/Workspace/VibeCoding/llm-probe/demo_minimal.py` | openai SDK | 97 行单次调用示例，**不用于诊断** |
 
 两者**共用** `~/Workspace/VibeCoding/llm-probe/.llm_probe.env`（600 权限，已 gitignore），
 互写互读的密文格式完全一致。
@@ -28,9 +28,12 @@ cd /home/yongchao/Workspace/VibeCoding/llm-probe
 # 1) 生成配置（已存在则不要加 --force，避免覆盖用户配置）
 python3 llm_probe.py init
 
-# 2) 写入加密密钥（口令走环境变量，别用 --passphrase，会进 shell 历史）
-export LLM_PASSPHRASE='你的口令'
-python3 llm_probe.py setkey --key 'sk-xxx'      # 或不带 --key 交互输入
+# 2) 写入加密密钥 —— 交互输入最稳（口令不进配置、不进 argv、不进 shell 历史）
+python3 llm_probe.py setkey                     # 依次提示 API Key 和解密口令
+#    非交互 / CI：key 走 stdin，口令走口令文件
+#      export LLM_PASSPHRASE_FILE=~/.llm_probe_pass    # echo '口令' > 该文件 && chmod 600
+#      printf '%s' "$KEY" | python3 llm_probe.py setkey
+#    --key / --passphrase 会留在 shell 历史和 ps 进程列表里（脚本会打警告），仅临时测试用
 
 # 3) 分层探测（不写 probe 子命令也行）
 python3 llm_probe.py probe
@@ -44,9 +47,9 @@ python3 llm_probe.py probe --base-url https://api.openai.com/v1 --model gpt-4o-m
 ./llm_probe.sh probe --base-url https://api.openai.com/v1 --model gpt-4o-mini --only net
 ```
 
-只要"发一条消息看通不通"、不需要分层诊断时，用 `demo_minimal.py`（85 行，含 openai 0.28 / 1.x 两套写法）；**可用性结论仍以 `probe` 的退出码为准**。
+只要"发一条消息看通不通"、不需要分层诊断时，用 `demo_minimal.py`（97 行，含 openai 0.28 / 1.x 两套写法）；**可用性结论仍以 `probe` 的退出码为准**。
 
-改过脚本之后跑回归：`./tests/run_tests.sh`，期望 `PASS=27 FAIL=0`（会短暂占用 18923 端口）。
+改过脚本之后跑回归：`./tests/run_tests.sh`，期望 `PASS=44 FAIL=0`（15 组场景，会短暂占用 18923 端口）；单元测试另跑 `python3 tests/test_units.py`。
 
 ## 分层与退出码（唯一权威判据）
 
@@ -97,8 +100,15 @@ python3 llm_probe.py showkey --plain       # 解密看明文（仅在用户明�
 
 - **不要**把 `LLM_PASSPHRASE`、`LLM_API_KEY` 或 `showkey --plain` 的输出回显到会话里；
   需要贴报告时只贴打码后的 `sk-xxx********xxxx (len=N)`。
-- 口令来源优先级：环境变量 `LLM_PASSPHRASE` > `LLM_PASSPHRASE_FILE` 指向的文件（600）> 终端交互输入。
-  **口令永远不写进 `.llm_probe.env`**，否则加密形同虚设。
+- 口令来源**按推荐顺序**（口令本身永远不写进 `.llm_probe.env`，否则加密形同虚设）：
+  1. `LLM_PASSPHRASE_FILE` 指向的口令文件（600）—— **非交互首选**
+  2. 终端交互输入 —— 最安全
+  3. 环境变量 `LLM_PASSPHRASE` —— 权宜之计：**会被所有子进程继承**，脚本读到后会立刻
+     从自己环境里摘掉（sh 端用 `VAR=val cmd` 只喂给 openssl 那一条命令）
+  - `--passphrase` / `--key` 会进 shell 历史和 `ps` 进程列表，两个实现都会打 stderr 警告，
+    仅用于临时测试；密钥的非交互入口是 stdin（`printf '%s' "$KEY" | ... setkey`）。
+- shell 版依赖 **OpenSSL ≥ 1.1.1**（`-pbkdf2` 是 1.1.1 才有的选项，LibreSSL 不支持），
+  启动时做功能探测，不支持会给出可读报错；Python 端装了 `cryptography` 就不依赖 openssl。
 - 配置文件是数据不是脚本：两个实现都自己解析 `KEY=VALUE`，**不 `source`**，不执行任何一行。
 - 配置文件权限应为 `600`；发现是 `644/664` 时提醒用户 `chmod 600`。
 - 工具只向用户给定的 `base_url` 发请求，不会外联其它地址。

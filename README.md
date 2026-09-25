@@ -30,14 +30,19 @@ DNS 挂了、key 过期了、`base_url` 少写了 `/v1`、模型名不对，还�
 # 1) 生成配置（.llm_probe.env，权限 600）
 python3 llm_probe.py init
 
-# 2) 加密写入密钥（口令只走环境变量，不进配置文件、不进命令行）
-export LLM_PASSPHRASE='你的口令'
-python3 llm_probe.py setkey            # 或 --key sk-xxx
+# 2) 加密写入密钥 —— 交互输入，推荐（口令不进配置、不进命令行、不进 shell 历史）
+python3 llm_probe.py setkey
+#    CI / 非交互则换成：密钥走 stdin（不进 argv、不进历史），口令走口令文件
+#      export LLM_PASSPHRASE_FILE=~/.llm_probe_pass   # echo '口令' > 该文件 && chmod 600
+#      printf '%s' "$KEY" | python3 llm_probe.py setkey
 
-# 3) 分层探测
-python3 llm_probe.py probe             # 不写 probe 也行
-./llm_probe.sh probe --json            # 同一份配置、同一种密文、同一套退出码
+# 3) 分层探测（口令来源见下面「密钥安全」的权衡表）
+python3 llm_probe.py probe                          # 不写 probe 也行
+./llm_probe.sh probe --json                         # 同一份配置、同一种密文、同一套退出码
 ```
+
+> `--key sk-xxx` / `--passphrase '口令'` 会留在 **shell 历史** 和 **`ps` 进程列表** 里，
+> 仅建议临时测试使用；两个实现都会对它们打一行 stderr 警告。
 
 没有配置文件也可以直接给参数，零副作用：
 
@@ -48,7 +53,7 @@ python3 llm_probe.py probe --base-url https://api.openai.com/v1 --model gpt-4o-m
 
 ## 最简 demo
 
-只想"发一条消息看看通不通"，看 [`demo_minimal.py`](demo_minimal.py)（85 行，含密钥读取与
+只想"发一条消息看看通不通"，看 [`demo_minimal.py`](demo_minimal.py)（97 行，含密钥读取与
 openai 0.28 / 1.x 两套写法，真正发请求的调用只有几行）：
 
 ```python
@@ -89,13 +94,16 @@ fi
 
 ```text
 llm-probe/
-├── llm_probe.py            # 869 行，Python 3.7+，零第三方依赖，含 L4 SDK 层
-├── llm_probe.sh            # 773 行，严格 POSIX（dash 验证），只依赖 curl + openssl
+├── llm_probe.py            # 974 行，Python 3.7+，零第三方依赖，含 L4 SDK 层
+├── llm_probe.sh            # 851 行，严格 POSIX（dash 验证），只依赖 curl + openssl
 ├── llm_probe.env.example   # 配置模板（init 会生成 .llm_probe.env，已 gitignore）
-├── demo_minimal.py         # 最简 demo：单次 SDK 调用
+├── demo_minimal.py         # 97 行最简 demo：单次 SDK 调用
 ├── docs/                   # 完整技术文章（含两份源码逐行附录）
 ├── skill/                  # OpenCode skill 副本（正本在 ~/.config/opencode/skills/）
-├── tests/                  # mock 服务 + 27 项分支断言
+├── tests/
+│   ├── run_tests.sh        # 15 组场景、44 项断言（含 py/sh 跨实现 JSON 一致性）
+│   ├── test_units.py       # 单元测试：配置解析 / 加解密 / 结论映射 / 密钥卫生
+│   └── mock_llm.py         # 6 种故障模式的 mock 服务
 ├── README.md
 └── .gitignore              # 忽略 .llm_probe.env、__pycache__
 ```
@@ -104,23 +112,52 @@ llm-probe/
 
 ```bash
 ./tests/run_tests.sh        # 需 curl、openssl、python3；短暂占用 18923 端口
-# PASS=27 FAIL=0，退出码 0
+# PASS=44 FAIL=0，退出码 0
+python3 tests/test_units.py # 单元测试也能单独跑（或用 pytest）
 ```
 
-10 组场景覆盖：正常端点、错误密钥、全站 401、路径 404、模型名 400、限流 429、
+15 组场景覆盖：正常端点、错误密钥、全站 401、路径 404、模型名 400、限流 429、
 `/models` 不实现、端口未监听、DNS 失败、非法 scheme、**密文双向互通**、
-**配置文件不被当代码执行**。测试刻意不读取真实配置的解密口令。
+**配置文件不被当代码执行**、**口令不泄漏给子进程**、**setkey 走 stdin**、
+**老 openssl 报错**、**py/sh 逐字段结论一致（6 种故障模式）**。
+测试刻意不读取真实配置的解密口令。
 
 ## 密钥安全
 
 - 密文格式 `enc:v1:<base64(Salted__ + salt + 密文)>`，参数与
   `openssl enc -aes-256-cbc -pbkdf2 -iter 300000 -md sha256` 完全对齐，
   **Python 写的密文 shell 能解，反之亦然**。
-- 口令来源优先级：环境变量 `LLM_PASSPHRASE` > `LLM_PASSPHRASE_FILE` 指向的文件（600）> 终端交互输入。
-  **口令永远不写进配置文件。**
-- 传给 openssl 时用 `-pass env:...`，口令不进命令行参数（否则 `ps` 可见）。
-- 配置文件是数据不是脚本：两个实现都自己解析 `KEY=VALUE`，**不 `source`**，不执行任何一行。
+- 口令本身**永远不写进配置文件**，传给 openssl 时用 `-pass env:...`，
+  口令不进命令行参数（否则 `ps` 直接可见）。
+- **口令从哪来**（脚本读到环境变量里的口令后，会立刻把它从自己的环境里摘掉，
+  这样后续子进程就再也拿不到）：
+
+  | 来源 | 泄露面 | 适用场景 |
+  |---|---|---|
+  | `LLM_PASSPHRASE_FILE` 指向的文件（600） | 只有文件权限 | **非交互 / CI 首选** |
+  | 终端交互输入（`getpass` / `stty -echo`） | 只在内存里过一遍 | **最安全** |
+  | 环境变量 `LLM_PASSPHRASE` | 会被子进程继承（读到即摘，仍有短暂窗口） | 权宜之计 |
+  | `--passphrase` 参数 | **shell 历史 + `ps` 进程列表** | 仅临时测试（会打警告） |
+
+- 密钥同理：`setkey` 支持从 **stdin 管道**读（`printf '%s' "$KEY" | ... setkey`），
+  不进 argv、不进历史；`--key` 会打 stderr 警告。
 - 报告里只输出打码后的密钥 `sk-xxx********xxxx (len=N)`。
+- 配置文件是数据不是脚本：两个实现都自己解析 `KEY=VALUE`（支持引号、拒绝空键），
+  **不 `source`**，不执行任何一行。
+
+## 兼容性
+
+| 实现 | 要求 | 说明 |
+|---|---|---|
+| `llm_probe.py` | Python 3.7+，**零第三方依赖** | 装了 `cryptography` 会优先走它；否则回退 `openssl` CLI |
+| `llm_probe.sh` | POSIX shell（dash/bash/zsh）、`curl`、`openssl ≥ 1.1.1` | `-pbkdf2` 是 1.1.1 才加的；LibreSSL 不支持，启动时做功能探测并给出可读报错 |
+
+配置文件、密文格式、退出码契约、`--json` 字段三者在两端**完全一致**，
+由 `tests/run_tests.sh` 第 15 组逐字段比对。
+
+> shell 版**刻意不用 `set -e`**：本工具的核心是"抓住 curl 的非零退出码来分类故障"，
+> `set -e` 会在第一个失败的 `err=$(curl ...)` 处直接中止——端口不通时一行报告都打不出来，
+> 只剩 curl 的原始退出码 7。关键命令的状态都在脚本里显式判断，由测试兜底。
 
 ## 文档
 

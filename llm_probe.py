@@ -57,16 +57,20 @@ ENV_TEMPLATE = """\
 # 注意：这是数据文件，不是 shell 脚本，任何一行都不会被当作命令执行。
 #
 # 生成本文件:  python3 llm_probe.py init
-# 写入密钥:    python3 llm_probe.py setkey        （交互输入，推荐）
-#              python3 llm_probe.py setkey --key sk-xxx
+# 写入密钥:    python3 llm_probe.py setkey                  （交互输入，推荐）
+#              printf '%s' "$KEY" | python3 llm_probe.py setkey   （非交互，走 stdin）
+#              python3 llm_probe.py setkey --key sk-xxx       （会进 shell 历史 / ps，
+#                                                              仅临时测试用）
 # 查看密钥:    python3 llm_probe.py showkey
 # 开始探测:    python3 llm_probe.py probe
 
-# OpenAI 兼容端点，通常以 /v1 结尾
-LLM_BASE_URL=https://aiapiv2.pekpik.com/v1
+# OpenAI 兼容端点，通常以 /v1 结尾。默认填官方地址；换服务商就改成它给的
+# base_url。（README 里的 https://aiapiv2.pekpik.com/v1 是第三方中转示例，
+# 别默认把密钥发给不认识的服务。）
+LLM_BASE_URL=https://api.openai.com/v1
 
 # 模型名按服务商自己的命名填
-LLM_MODEL=claude-opus-4-7
+LLM_MODEL=gpt-4o-mini
 
 # 加密后的密钥（enc:v1:... ），由 setkey 写入，不要手填
 LLM_API_KEY_ENC=
@@ -76,9 +80,10 @@ LLM_API_KEY_ENC=
 LLM_API_KEY=
 
 # 解密口令来源（口令本身永远不写进本文件，否则加密就失去意义了）：
-#   1) 环境变量 LLM_PASSPHRASE
-#   2) LLM_PASSPHRASE_FILE 指向的口令文件（建议 chmod 600）
-#   3) 终端交互输入
+#   1) LLM_PASSPHRASE_FILE 指向的口令文件（建议 chmod 600，非交互首选）
+#   2) 终端交互输入（最安全）
+#   3) 环境变量 LLM_PASSPHRASE（权宜之计：环境变量会被子进程继承，
+#      读到后本脚本会立即从环境里摘掉）
 LLM_PASSPHRASE_FILE=
 
 # 探测参数
@@ -103,6 +108,8 @@ def parse_env_file(path):
                 raise ValueError(f"{path}:{lineno}: 不是合法的 KEY=VALUE: {line!r}")
             key, _, value = line.partition("=")
             key = key.strip()
+            if not key:
+                raise ValueError(f"{path}:{lineno}: KEY 不能为空: {line!r}")
             value = value.strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
                 value = value[1:-1]
@@ -171,7 +178,40 @@ def _pkcs7_unpad(data):
     return data[:-pad]
 
 
+_OPENSSL_PBKDF2_OK = None
+
+
+def _openssl_pbkdf2_ok():
+    """功能性探测 openssl 是否支持 -pbkdf2（OpenSSL >= 1.1.1；LibreSSL 不支持）。
+
+    比读版本号可靠：LibreSSL 的版本号长成 3.x 却没有 -pbkdf2。
+    """
+    global _OPENSSL_PBKDF2_OK
+    if _OPENSSL_PBKDF2_OK is not None:
+        return _OPENSSL_PBKDF2_OK
+    try:
+        probe = subprocess.run(
+            ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "1000",
+             "-md", "sha256", "-pass", "pass:probe", "-in", os.devnull],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        ok = probe.returncode == 0
+    except OSError:
+        ok = False
+    _OPENSSL_PBKDF2_OK = ok
+    return ok
+
+
+def _require_openssl_pbkdf2():
+    if not _openssl_pbkdf2_ok():
+        raise ValueError(
+            "这台机器的 openssl 不支持 -pbkdf2（需要 OpenSSL >= 1.1.1，LibreSSL 不支持），"
+            "也未安装 cryptography 模块。解决：升级 openssl，或 pip install cryptography。"
+        )
+
+
 def _encrypt_openssl(plain, passphrase):
+    _require_openssl_pbkdf2()
     """走 openssl CLI（无 cryptography 模块时的兜底，也是 shell 端的实现）。"""
     env = dict(os.environ, LLM_PP_PASSPHRASE=passphrase)
     proc = subprocess.run(
@@ -190,6 +230,7 @@ def _encrypt_openssl(plain, passphrase):
 
 
 def _decrypt_openssl(blob, passphrase):
+    _require_openssl_pbkdf2()
     env = dict(os.environ, LLM_PP_PASSPHRASE=passphrase)
     proc = subprocess.run(
         [
@@ -266,12 +307,41 @@ def mask_secret(secret):
     return f"{secret[:6]}{'*' * 8}{secret[-4:]} (len={len(secret)})"
 
 
+def scrub_env(*names):
+    """读完就把口令/密钥从本进程环境变量里摘掉。
+
+    环境变量会被每个子进程无条件继承（curl、openssl、openai SDK，以及它们
+    自己再拉起的进程），留在 os.environ 等于把密钥广播给整棵进程树。取值已经
+    存进局部变量，后续逻辑不受影响。
+    """
+    for name in names:
+        os.environ.pop(name, None)
+
+
+def warn_secret_arg(flag):
+    """命令行参数里的密钥会同时出现在 shell 历史和 ps 进程列表里。"""
+    print(
+        f"⚠ 警告: {flag} 会留在 shell 历史和进程列表 (ps) 里，"
+        "仅建议临时测试用；日常请用交互输入、stdin 管道或环境变量。",
+        file=sys.stderr,
+    )
+
+
 def read_passphrase(args, cfg, *, confirm=False, allow_prompt=True):
-    """口令来源：--passphrase > LLM_PASSPHRASE 环境变量 > 口令文件 > 交互。"""
+    """口令来源：--passphrase > LLM_PASSPHRASE 环境变量 > 口令文件 > 交互。
+
+    三个来源的权衡见 README「口令从哪来」一节：
+      * 口令文件  —— 非交互首选，chmod 600，不进进程环境
+      * 交互输入 —— 最安全，只在内存里过一遍
+      * 环境变量 —— 权宜之计；读到后立即摘掉，避免被子进程继承
+    """
     if getattr(args, "passphrase", None):
+        warn_secret_arg("--passphrase")
         return args.passphrase
     if os.environ.get("LLM_PASSPHRASE"):
-        return os.environ["LLM_PASSPHRASE"]
+        value = os.environ["LLM_PASSPHRASE"]
+        scrub_env("LLM_PASSPHRASE", "LLM_PP_PASSPHRASE")
+        return value
     passphrase_file = cfg.get("LLM_PASSPHRASE_FILE") or ""
     if passphrase_file:
         passphrase_file = os.path.expanduser(passphrase_file)
@@ -643,7 +713,10 @@ def cmd_probe(args):
             steps.append({"name": "L3 推理", "ok": False, "skipped": True,
                           "detail": "L2 认证未通过，已跳过（--all 可强制执行）"})
         else:
-            steps.append(step_infer(base_url, key, model, prompt, max_tokens, timeout))
+            step = step_infer(base_url, key, model, prompt, max_tokens, timeout)
+            # 与 sh 端 JSON 对齐：L3 恒带 skipped 字段（真跑过 = false）
+            step.setdefault("skipped", False)
+            steps.append(step)
 
     if only in (None, "sdk") and (args.sdk or only == "sdk"):
         steps.append(step_sdk(base_url, key, model, prompt, timeout))
@@ -667,17 +740,22 @@ def cmd_probe(args):
 def resolve_key(args, cfg):
     """密钥优先级：--key > LLM_API_KEY 环境变量 > 解密 LLM_API_KEY_ENC > LLM_API_KEY 明文。"""
     if getattr(args, "key", None):
+        warn_secret_arg("--key")
         return args.key, "--key 参数"
     if os.environ.get("LLM_API_KEY"):
-        return os.environ["LLM_API_KEY"], "环境变量 LLM_API_KEY"
+        value = os.environ["LLM_API_KEY"]
+        scrub_env("LLM_API_KEY")   # 同口令：读到就摘，别让它跟着子进程走
+        return value, "环境变量 LLM_API_KEY"
     token = cfg.get("LLM_API_KEY_ENC") or os.environ.get("LLM_API_KEY_ENC")
     if token:
         passphrase = read_passphrase(args, cfg)
         if not passphrase:
             raise SystemExit(
-                "配置里是加密密钥，但拿不到解密口令。\n"
-                "  设置环境变量 LLM_PASSPHRASE，或配置 LLM_PASSPHRASE_FILE，"
-                "或在终端交互输入。")
+                "配置里是加密密钥，但拿不到解密口令。按推荐顺序任选其一：\n"
+                "  1) LLM_PASSPHRASE_FILE 指向口令文件（chmod 600，非交互场景首选）\n"
+                "  2) 在终端交互输入（最安全）\n"
+                "  3) 环境变量 LLM_PASSPHRASE（权宜之计：环境变量会被子进程继承，\n"
+                "     读到后本脚本会立即摘掉；详见 README「口令从哪来」权衡表）")
         try:
             return decrypt_secret(token, passphrase), "配置文件（已解密）"
         except ValueError as exc:
@@ -698,13 +776,29 @@ def cmd_setkey(args):
         if init_config(config_path):
             return 1
     cfg = parse_env_file(config_path)
-    key = args.key or os.environ.get("LLM_API_KEY")
+    if getattr(args, "key", None):
+        warn_secret_arg("--key")
+        key = args.key
+    else:
+        key = os.environ.get("LLM_API_KEY")
+        if key:
+            scrub_env("LLM_API_KEY")   # 读到就摘：别让它跟着子进程走
     if not key:
-        if not sys.stdin.isatty():
-            print("非交互环境请用 --key 或 LLM_API_KEY 环境变量传入", file=sys.stderr)
-            return 1
-        import getpass
-        key = getpass.getpass("API Key: ").strip()
+        if sys.stdin.isatty():
+            import getpass
+            key = getpass.getpass("API Key: ").strip()
+        else:
+            # 非交互：优先从 stdin 读。管道内容不进 argv、不进 shell 历史。
+            data = sys.stdin.read().strip()
+            key = data.splitlines()[0].strip() if data else ""
+            if not key:
+                print(
+                    "拿不到密钥。非交互环境建议从管道读：\n"
+                    "  printf '%s' \"$KEY\" | python3 llm_probe.py setkey\n"
+                    "  （或用 LLM_API_KEY 环境变量；--key 会留在 shell 历史和 ps 进程列表里）",
+                    file=sys.stderr,
+                )
+                return 1
     if not key:
         print("密钥为空", file=sys.stderr)
         return 1
@@ -712,7 +806,11 @@ def cmd_setkey(args):
     if not passphrase:
         print("需要解密口令（以后读取密钥时要用同一个口令）", file=sys.stderr)
         return 1
-    token = encrypt_secret(key, passphrase)
+    try:
+        token = encrypt_secret(key, passphrase)
+    except (ValueError, subprocess.SubprocessError) as exc:
+        print(f"加密失败: {exc}", file=sys.stderr)
+        return 1
     update_env_file(config_path, {"LLM_API_KEY_ENC": token, "LLM_API_KEY": ""})
     print(f"已加密写入: {config_path}")
     print(f"密钥       : {mask_secret(key)}")
@@ -794,8 +892,10 @@ def build_parser():
     probe.add_argument("--prompt", metavar="TEXT")
     probe.add_argument("--timeout", type=float, metavar="SEC")
     probe.add_argument("--max-tokens", type=int, metavar="N")
-    probe.add_argument("--key", metavar="KEY", help="临时指定密钥（不读配置）")
-    probe.add_argument("--passphrase", metavar="PWD", help="解密口令（不推荐，会进 shell 历史）")
+    probe.add_argument("--key", metavar="KEY",
+                       help="临时指定密钥（不读配置；会留在 shell 历史和 ps 进程列表里，仅测试用）")
+    probe.add_argument("--passphrase", metavar="PWD",
+                       help="解密口令（同上；推荐 LLM_PASSPHRASE_FILE 口令文件或交互输入）")
     probe.add_argument("--only", choices=("net", "auth", "infer", "sdk"),
                        help="只跑某一层: net=L1 / auth=L1+L2 / infer=L1+L3 / sdk=L1+L4")
     probe.add_argument("--all", action="store_true", help="认证失败也继续测推理")
@@ -808,16 +908,21 @@ def build_parser():
     init.add_argument("--force", action="store_true", help="覆盖已存在的配置")
 
     setkey = sub.add_parser("setkey", parents=[common], help="加密写入 API Key")
-    setkey.add_argument("--key", metavar="KEY")
-    setkey.add_argument("--passphrase", metavar="PWD")
+    setkey.add_argument("--key", metavar="KEY",
+                        help="密钥直接给（会留在 shell 历史/ps；推荐交互输入或 stdin 管道）")
+    setkey.add_argument("--passphrase", metavar="PWD",
+                        help="解密口令直接给（同上；推荐口令文件或交互输入）")
 
     showkey = sub.add_parser("showkey", parents=[common], help="解密显示 API Key")
     showkey.add_argument("--plain", action="store_true", help="显示完整明文")
-    showkey.add_argument("--passphrase", metavar="PWD")
+    showkey.add_argument("--passphrase", metavar="PWD",
+                         help="解密口令直接给（会留在 shell 历史/ps；推荐口令文件或交互输入）")
 
     env = sub.add_parser("env", parents=[common], help="打印生效配置")
-    env.add_argument("--key", metavar="KEY")
-    env.add_argument("--passphrase", metavar="PWD")
+    env.add_argument("--key", metavar="KEY",
+                     help="临时指定密钥（会留在 shell 历史/ps，仅测试用）")
+    env.add_argument("--passphrase", metavar="PWD",
+                     help="解密口令直接给（推荐口令文件或交互输入）")
     return parser
 
 

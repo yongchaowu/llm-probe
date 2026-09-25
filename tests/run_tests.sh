@@ -1,7 +1,7 @@
 #!/bin/sh
-# llm_probe 分支测试：mock 服务 + py/sh 双实现，27 项断言
+# llm_probe 分支测试：mock 服务 + py/sh 双实现，44 项断言
 # 用法: ./run_tests.sh          （需 curl、openssl、python3；会短暂占用 18923 端口）
-# 全部通过时输出 PASS=27 FAIL=0，退出码 0
+# 全部通过时输出 PASS=44 FAIL=0，退出码 0
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_DIR=$(dirname "$SCRIPT_DIR")
 LOGDIR=$(mktemp -d)
@@ -169,6 +169,136 @@ rm -f /tmp/opencode/pwned
 python3 llm_probe.py -c "$CFG" probe >/dev/null 2>&1
 [ ! -f /tmp/opencode/pwned ] && echo "  ✅ py 不执行配置文件内容" || { echo "  ❌ 配置被当命令执行了!"; FAIL=$((FAIL+1)); }
 rm -f "$CFG"
+
+echo "== 11. 口令不泄漏给子进程 =="
+# 用 shim 包一层 curl/openssl，记录它们各自环境里出现 LLM_PASSPHRASE 的次数
+SHIM="$LOGDIR/shim"
+mkdir -p "$SHIM"
+REAL_CURL=$(command -v curl)
+REAL_OPENSSL=$(command -v openssl)
+cat > "$SHIM/curl" <<EOF
+#!/bin/sh
+env | grep -c '^LLM_PASSPHRASE=' >> "$LOGDIR/curl_pp"
+exec $REAL_CURL "\$@"
+EOF
+cat > "$SHIM/openssl" <<EOF
+#!/bin/sh
+env | grep -c '^LLM_PASSPHRASE=' >> "$LOGDIR/openssl_pp"
+exec $REAL_OPENSSL "\$@"
+EOF
+chmod +x "$SHIM/curl" "$SHIM/openssl"
+LEAKDIR=$(mktemp -d)
+python3 llm_probe.py -c "$LEAKDIR/leak.env" init >/dev/null 2>&1
+python3 llm_probe.py -c "$LEAKDIR/leak.env" setkey --key 'sk-leak-test' --passphrase 'leak-2026' >/dev/null 2>&1
+rm -f "$LOGDIR/curl_pp" "$LOGDIR/openssl_pp"
+PATH="$SHIM:$PATH" LLM_PASSPHRASE='leak-2026' \
+    ./llm_probe.sh -c "$LEAKDIR/leak.env" probe --only auth >/dev/null 2>&1
+grep -q '^[1-9]' "$LOGDIR/curl_pp" 2>/dev/null && RCBAD=1 || RCBAD=0
+check "sh 口令不出现在 curl 子进程环境里" 0 $RCBAD
+grep -q '^[1-9]' "$LOGDIR/openssl_pp" 2>/dev/null && RCGOOD=0 || RCGOOD=1
+check "sh 口令确实喂给了 openssl（解密能用）" 0 $RCGOOD
+LLM_PASSPHRASE='unit-pw' python3 - >"$LOGDIR"/env_scrub.log 2>&1 <<'PY'
+import os, subprocess, sys
+sys.path.insert(0, ".")
+import llm_probe
+
+class A:
+    passphrase = None
+
+pw = llm_probe.read_passphrase(A(), {})
+n = subprocess.run(["sh", "-c", "env | grep -c '^LLM_PASSPHRASE='"],
+                   capture_output=True, text=True, check=False).stdout.strip()
+sys.exit(0 if (pw == "unit-pw" and "LLM_PASSPHRASE" not in os.environ and n == "0") else 1)
+PY
+check "py 读到口令即摘除、子进程看不到" 0 $?
+
+echo "== 12. setkey 走 stdin（非交互免 argv）=="
+printf 'sk-stdin-11\n' | ./llm_probe.sh -c "$LEAKDIR/s11.env" setkey --passphrase 'pw-stdin' >/dev/null 2>&1
+GOT=$(./llm_probe.sh -c "$LEAKDIR/s11.env" showkey --plain --passphrase 'pw-stdin' 2>/dev/null)
+[ "$GOT" = "sk-stdin-11" ] && RC=0 || RC=1
+check "sh setkey 从 stdin 读密钥并可解开" 0 $RC
+printf 'sk-stdin-12\n' | python3 llm_probe.py -c "$LEAKDIR/s12.env" setkey --passphrase 'pw-stdin' >/dev/null 2>&1
+GOT=$(python3 llm_probe.py -c "$LEAKDIR/s12.env" showkey --plain --passphrase 'pw-stdin' 2>/dev/null)
+[ "$GOT" = "sk-stdin-12" ] && RC=0 || RC=1
+check "py setkey 从 stdin 读密钥并可解开" 0 $RC
+./llm_probe.sh -c "$LEAKDIR/s13.env" setkey --passphrase 'pw' </dev/null >/dev/null 2>&1
+check "sh 非交互且无输入 → 1" 1 $?
+python3 llm_probe.py -c "$LEAKDIR/s14.env" setkey --passphrase 'pw' </dev/null >/dev/null 2>&1
+check "py 非交互且无输入 → 1" 1 $?
+
+echo "== 13. 老 openssl（无 -pbkdf2）给出可读报错 =="
+OLDSSL="$LOGDIR/oldssl"
+mkdir -p "$OLDSSL"
+cat > "$OLDSSL/openssl" <<EOF
+#!/bin/sh
+for a in "\$@"; do
+  if [ "\$a" = "-pbkdf2" ]; then
+    echo "enc: Unknown option -pbkdf2" >&2
+    exit 1
+  fi
+done
+exec $REAL_OPENSSL "\$@"
+EOF
+chmod +x "$OLDSSL/openssl"
+PATH="$OLDSSL:$PATH" ./llm_probe.sh -c "$LEAKDIR/leak.env" showkey --plain \
+    --passphrase 'leak-2026' >"$LOGDIR"/t20.log 2>&1
+check "sh 老 openssl → 1" 1 $?
+grep -q "不支持 -pbkdf2" "$LOGDIR"/t20.log && RC=0 || RC=1
+check "sh 报错说清了原因与出路" 0 $RC
+PATH="$OLDSSL:$PATH" python3 - >"$LOGDIR"/t21.log 2>&1 <<'PY'
+import sys
+sys.path.insert(0, ".")
+import llm_probe
+llm_probe._OPENSSL_PBKDF2_OK = None      # 强制重新探测
+sys.exit(0 if not llm_probe._openssl_pbkdf2_ok() else 1)
+PY
+check "py 识别老 openssl 不支持 -pbkdf2" 0 $?
+rm -rf "$LEAKDIR"
+
+echo "== 14. 单元测试 =="
+python3 "$SCRIPT_DIR"/test_units.py >"$LOGDIR"/units.log 2>&1
+RC=$?
+check "tests/test_units.py 全部通过" 0 $RC
+[ "$RC" -eq 0 ] || tail -6 "$LOGDIR"/units.log
+
+echo "== 15. py / sh 跨实现结论一致（JSON 逐字段）=="
+for mode in ok unauthorized badpath badmodel ratelimit noreduce; do
+    start_mock "$mode"
+    python3 llm_probe.py probe --base-url "$BASE_URL" --model mock-a --key sk-good --json \
+        >"$LOGDIR"/x.json 2>/dev/null
+    ARC=$?
+    ./llm_probe.sh probe --base-url "$BASE_URL" --model mock-a --key sk-good --json \
+        >"$LOGDIR"/y.json 2>/dev/null
+    BRC=$?
+    stop_mock
+    python3 - "$LOGDIR"/x.json "$LOGDIR"/y.json "$ARC" "$BRC" >"$LOGDIR"/cmp.log 2>&1 <<'PY'
+import json, sys
+a = json.load(open(sys.argv[1]))
+b = json.load(open(sys.argv[2]))
+ar, br = int(sys.argv[3]), int(sys.argv[4])
+
+def norm(d):
+    return [(s["name"], bool(s.get("ok")), bool(s.get("skipped", False)))
+            for s in d["steps"]]
+
+problems = []
+if not (a["exit_code"] == b["exit_code"] == ar == br):
+    problems.append(f"exit_code {a['exit_code']}/{b['exit_code']}/{ar}/{br}")
+if norm(a) != norm(b):
+    problems.append(f"steps {norm(a)} vs {norm(b)}")
+if a["verdict"] != b["verdict"]:
+    problems.append(f"verdict {a['verdict']!r} vs {b['verdict']!r}")
+for key in ("version", "base_url", "model", "key_masked", "key_source",
+            "config", "verdict", "exit_code"):
+    if key not in a or key not in b:
+        problems.append(f"JSON 缺字段 {key}")
+if problems:
+    print("; ".join(problems))
+    sys.exit(1)
+sys.exit(0)
+PY
+    check "$mode: py/sh 退出码+步骤+结论+schema 一致" 0 $?
+done
 
 echo
 echo "=================================="

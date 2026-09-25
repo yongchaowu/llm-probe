@@ -23,6 +23,13 @@
 #   --direct                 不走系统代理
 #   --json                   JSON 输出
 
+# 刻意只用 `set -u`，不用 `set -e`：
+# 这个脚本的核心是"抓住 curl/openssl 的非零退出码来分类故障"。`set -e` 会在
+# 第一个失败的 `err=$(curl ...)` 处直接中止，导致：
+#   * 端口不通时一行报告都不打印（实测 0 行输出），只留下 curl 的原始退出码 7
+#   * 期望的"退出码 2 + 12 行分层报告"完全丢失
+# 每个关键命令的退出状态都在下面显式判断（curl → classify_curl_error，
+# openssl → decrypt_key 的 if ! ... ），漏掉的靠 tests/run_tests.sh 兜底。
 set -u
 
 VERSION="1.0"
@@ -50,6 +57,8 @@ FORCE=0
 
 BODY_FILE=""
 ERR_FILE=""
+TMP_DIR=""
+PASSPHRASE=""
 
 # load_config 可能因配置文件缺失而提前返回，这些全局必须先初始化（set -u）
 API_KEY_ENC=""
@@ -65,11 +74,29 @@ LAST_CURL_MSG=""
 # ---------------------------------------------------------------------------
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
+# 命令行参数里的密钥会同时留在 shell 历史和 ps 进程列表里
+warn_secret_arg() {  # $1 = 参数名
+    printf '⚠ 警告: %s 会留在 shell 历史和进程列表 (ps) 里，仅建议临时测试用；日常请用交互输入、stdin 管道或环境变量。\n' "$1" >&2
+}
+
 cleanup() {
+    [ -n "${TMP_DIR:-}" ] && rm -rf "$TMP_DIR"
     [ -n "$BODY_FILE" ] && rm -f "$BODY_FILE"
     [ -n "$ERR_FILE" ] && rm -f "$ERR_FILE"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT INT TERM HUP QUIT
+
+# 临时响应体集中放在一个私有目录里（umask 077 → 0700），退出即删。
+# 注意：kill -9 / SIGKILL 不触发 trap，目录会残留；下次运行是新建目录，不会
+# 复用旧的。彻底清理: rm -rf "${TMPDIR:-/tmp}"/llm_probe.*
+init_tmpdir() {
+    umask 077
+    TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/llm_probe.XXXXXX") || die "mktemp -d 失败：无法创建临时目录"
+    BODY_FILE="$TMP_DIR/response.json"
+    ERR_FILE="$TMP_DIR/curl.err"
+    : > "$BODY_FILE"
+    : > "$ERR_FILE"
+}
 
 usage() {
     cat <<EOF
@@ -89,16 +116,18 @@ $PROG $VERSION —— OpenAI 兼容 LLM 端点连通性探测（curl + openssl�
   --prompt TEXT     测试提示词（默认取配置 LLM_PROMPT）
   --timeout SEC     超时秒数（默认取配置 LLM_TIMEOUT）
   --max-tokens N    最大生成 token（默认 64）
-  --key KEY         临时密钥，不读配置
-  --passphrase PWD  解密口令（会进 shell 历史，不推荐）
+  --key KEY         临时密钥（会进 shell 历史和 ps，仅临时测试用）
+  --passphrase PWD  解密口令（同上；推荐口令文件或交互输入）
   --only LEVEL      只跑某一层: net=L1 / auth=L1+L2 / infer=L1+L3
   --all             认证失败也继续测推理
   --direct          不走系统代理（绕过 http_proxy/https_proxy）
   --json            JSON 输出
 
 密钥选项:
-  setkey --key K    直接给密钥（否则交互输入）
-  setkey/showkey --passphrase P
+  setkey            交互输入密钥（推荐）
+  printf '%s' "$K" | setkey     非交互：从 stdin 读，不进 argv / 历史
+  setkey --key K    直接给密钥（会留在 shell 历史和 ps 进程列表里）
+  setkey/showkey --passphrase P  口令直接给（同上；推荐口令文件或交互）
 
 退出码:
   0 全部通过   1 用法/配置错误   2 网络不通   3 认证失败   4 推理失败
@@ -166,11 +195,13 @@ write_template() { # $1 = 目标文件
 #
 # 也可以用 python3 llm_probe.py 操作同一份配置，两端密文互通。
 
-# OpenAI 兼容端点，通常以 /v1 结尾
-LLM_BASE_URL=https://aiapiv2.pekpik.com/v1
+# OpenAI 兼容端点，通常以 /v1 结尾。默认填官方地址；换服务商就改成它给的
+# base_url。（README 里的 https://aiapiv2.pekpik.com/v1 是第三方中转示例，
+# 别默认把密钥发给不认识的服务。）
+LLM_BASE_URL=https://api.openai.com/v1
 
 # 模型名按服务商自己的命名填
-LLM_MODEL=claude-opus-4-7
+LLM_MODEL=gpt-4o-mini
 
 # 加密后的密钥（enc:v1:... ），由 setkey 写入，不要手填
 LLM_API_KEY_ENC=
@@ -196,7 +227,7 @@ set_config_value() { # $1=KEY $2=VALUE  —— 原地替换或追加，保留注
         write_template "$CONFIG"
     fi
     if grep -q "^[[:space:]]*$key=" "$CONFIG"; then
-        tmp=$(mktemp)
+        tmp=$(mktemp) || die "mktemp 失败：无法创建临时文件"
         # 用 awk 替换，避免 value 里的 & / 反斜杠被 sed 解释
         awk -v k="$key" -v v="$value" '
             index($0, k "=") == 1 || $0 ~ ("^[[:space:]]*" k "=") {
@@ -213,17 +244,41 @@ set_config_value() { # $1=KEY $2=VALUE  —— 原地替换或追加，保留注
 # ---------------------------------------------------------------------------
 # 密钥加密 / 解密（openssl AES-256-CBC + PBKDF2-SHA256，与 Python 端互通）
 # ---------------------------------------------------------------------------
-need_passphrase() {  # $1 = 是否要求确认输入
+require_openssl() {  # -pbkdf2 需要 OpenSSL >= 1.1.1（LibreSSL 不支持）
+    [ "${OPENSSL_PBKDF2_OK:-}" = "1" ] && return 0
+    command -v openssl >/dev/null 2>&1 \
+        || die "找不到 openssl：加解密需要它（请安装 OpenSSL >= 1.1.1）"
+    probe_file=$(mktemp "${TMPDIR:-/tmp}/llm_probe_pbkdf2.XXXXXX") || die "mktemp 失败"
+    printf 'x' > "$probe_file"
+    if openssl enc -aes-256-cbc -pbkdf2 -iter 1000 -md sha256 \
+        -pass pass:probe -in "$probe_file" -out /dev/null 2>/dev/null; then
+        rm -f "$probe_file"
+        OPENSSL_PBKDF2_OK=1
+    else
+        rm -f "$probe_file"
+        die "当前 openssl 不支持 -pbkdf2（需要 OpenSSL >= 1.1.1；LibreSSL 不支持）。
+  解决：升级 openssl，或改用 python3 llm_probe.py（装了 cryptography 模块就不依赖 openssl）。"
+    fi
+}
+
+# 口令只活在这个局部变量里，**绝不 export**：一旦 export，后续每个子进程
+# （curl、openssl、被调起的任何程序）都会无条件继承它，等于把口令广播出去。
+# openssl 需要它时用 `VAR=val cmd` 形式只喂给那一条命令。
+need_passphrase() {  # $1 = 是否要求确认输入（confirm）
+    PASSPHRASE=""
     if [ -n "$PASSPHRASE_ARG" ]; then
-        LLM_PASSPHRASE=$PASSPHRASE_ARG
+        PASSPHRASE=$PASSPHRASE_ARG
+        warn_secret_arg "--passphrase"
     elif [ -n "${LLM_PASSPHRASE:-}" ]; then
-        :
+        PASSPHRASE=$LLM_PASSPHRASE
+        # 环境变量会被子进程继承，读到就摘掉
+        unset LLM_PASSPHRASE
     elif [ -n "${PASSPHRASE_FILE:-}" ] && [ -f "$PASSPHRASE_FILE" ]; then
-        LLM_PASSPHRASE=$(head -n 1 "$PASSPHRASE_FILE")
+        PASSPHRASE=$(head -n 1 "$PASSPHRASE_FILE")
     elif [ -t 0 ]; then
         printf '解密口令: ' >&2
         stty -echo 2>/dev/null || true
-        read -r LLM_PASSPHRASE
+        read -r PASSPHRASE
         stty echo 2>/dev/null || true
         printf '\n' >&2
         if [ "$1" = "confirm" ]; then
@@ -232,29 +287,34 @@ need_passphrase() {  # $1 = 是否要求确认输入
             read -r again
             stty echo 2>/dev/null || true
             printf '\n' >&2
-            [ "$LLM_PASSPHRASE" = "$again" ] || die "两次输入的口令不一致"
+            [ "$PASSPHRASE" = "$again" ] || die "两次输入的口令不一致"
         fi
     else
-        die "拿不到解密口令：设置 LLM_PASSPHRASE、配置 LLM_PASSPHRASE_FILE，或在终端交互输入"
+        die "拿不到解密口令，按推荐顺序任选其一：
+  1) LLM_PASSPHRASE_FILE 指向口令文件（chmod 600，非交互场景首选）
+  2) 在终端交互输入（最安全）
+  3) 环境变量 LLM_PASSPHRASE（权宜之计：环境变量会被子进程继承，见 README 权衡表）"
     fi
-    export LLM_PASSPHRASE
-    [ -n "$LLM_PASSPHRASE" ] || die "口令为空"
+    [ -n "$PASSPHRASE" ] || die "口令为空"
 }
 
 encrypt_key() {  # stdin → enc:v1:...
-    openssl enc -aes-256-cbc -pbkdf2 -iter "$PBKDF2_ITER" -md sha256 -salt \
-        -pass env:LLM_PASSPHRASE 2>/dev/null | openssl base64 -A
+    # 口令只出现在这一条命令的环境里（VAR=val cmd，不 export）：
+    # 既不进 ps 参数列表，也不被其它子进程继承。
+    LLM_PASSPHRASE=$PASSPHRASE openssl enc -aes-256-cbc -pbkdf2 -iter "$PBKDF2_ITER" \
+        -md sha256 -salt -pass env:LLM_PASSPHRASE 2>/dev/null | openssl base64 -A
 }
 
 decrypt_key() {  # $1 = enc:v1:... → stdout 明文
+    # 常被 $( ) 子 shell 调用，这里不能 die（会只死子 shell），由调用方先 require_openssl
     case $1 in
         "$ENC_PREFIX"*) ;;
         *) return 1 ;;
     esac
     printf '%s' "${1#"$ENC_PREFIX"}" \
         | openssl base64 -d -A 2>/dev/null \
-        | openssl enc -d -aes-256-cbc -pbkdf2 -iter "$PBKDF2_ITER" -md sha256 \
-            -pass env:LLM_PASSPHRASE 2>/dev/null
+        | LLM_PASSPHRASE=$PASSPHRASE openssl enc -d -aes-256-cbc -pbkdf2 -iter "$PBKDF2_ITER" \
+            -md sha256 -pass env:LLM_PASSPHRASE 2>/dev/null
 }
 
 mask_key() {
@@ -273,15 +333,19 @@ mask_key() {
 
 resolve_key() {
     if [ -n "$KEY" ]; then
+        warn_secret_arg "--key"
         KEY_SOURCE="--key 参数"
         return 0
     fi
     if [ -n "${LLM_API_KEY:-}" ]; then
         KEY=$LLM_API_KEY
+        # 读到就摘：环境变量会被后续每个子进程无条件继承
+        unset LLM_API_KEY
         KEY_SOURCE="环境变量 LLM_API_KEY"
         return 0
     fi
     if [ -n "$API_KEY_ENC" ]; then
+        require_openssl
         need_passphrase ""
         if ! KEY=$(decrypt_key "$API_KEY_ENC"); then
             die "解密失败：口令错误，或密文损坏"
@@ -496,8 +560,7 @@ run_probe() {
         resolve_key
     fi
 
-    BODY_FILE=$(mktemp)
-    ERR_FILE=$(mktemp)
+    init_tmpdir
 
     STEP1_OK=0; STEP1_KIND=""; STEP1_DETAIL=""
     STEP2_OK=0; STEP2_FATAL=1; STEP2_KIND=""; STEP2_DETAIL=""
@@ -562,6 +625,7 @@ run_probe() {
         printf '  "model": "%s",\n' "$(json_escape "$MODEL")"
         printf '  "key_masked": "%s",\n' "$(json_escape "$(mask_key "$KEY")")"
         printf '  "key_source": "%s",\n' "$(json_escape "$KEY_SOURCE")"
+        printf '  "config": "%s",\n' "$(json_escape "$CONFIG")"
         printf '  "steps": [\n'
         printf '    {"name": "L1 网络", "ok": %s, "detail": "%s"}' \
             "$([ "$STEP1_OK" -eq 1 ] && echo true || echo false)" "$(json_escape "$STEP1_DETAIL")"
@@ -635,10 +699,12 @@ do_setkey() {
         do_init || return 1
     fi
     load_config
+    [ -n "$KEY" ] && warn_secret_arg "--key"
     new_key=$KEY
     if [ -z "$new_key" ]; then
         if [ -n "${LLM_API_KEY:-}" ]; then
             new_key=$LLM_API_KEY
+            unset LLM_API_KEY        # 读到就摘：别让它跟着子进程走
         elif [ -t 0 ]; then
             printf 'API Key: ' >&2
             stty -echo 2>/dev/null || true
@@ -646,11 +712,20 @@ do_setkey() {
             stty echo 2>/dev/null || true
             printf '\n' >&2
         else
-            die "非交互环境请用 --key 或 LLM_API_KEY 环境变量传入"
+            # 非交互：优先从 stdin 读（管道内容不进 argv、不进 shell 历史）
+            if IFS= read -r new_key; then
+                new_key=$(printf '%s' "$new_key" | head -n 1)
+            else
+                new_key=""
+            fi
+            [ -n "$new_key" ] || die "拿不到密钥。非交互环境建议从管道读:
+  printf '%s' \"\$KEY\" | $PROG setkey
+（或用 LLM_API_KEY 环境变量；--key 会留在 shell 历史和 ps 进程列表里）"
         fi
     fi
     [ -n "$new_key" ] || die "密钥为空"
     PASSPHRASE_FILE="${LLM_PASSPHRASE_FILE:-$(strip_quotes "$(cfg_get LLM_PASSPHRASE_FILE)")}"
+    require_openssl
     need_passphrase confirm
     token=$(printf '%s' "$new_key" | encrypt_key)
     [ -n "$token" ] || die "加密失败（openssl 不可用？）"
@@ -669,6 +744,7 @@ do_showkey() {
     load_config
     if [ -n "$API_KEY_ENC" ]; then
         PASSPHRASE_FILE="${LLM_PASSPHRASE_FILE:-$(strip_quotes "$(cfg_get LLM_PASSPHRASE_FILE)")}"
+        require_openssl
         need_passphrase ""
         if ! plain=$(decrypt_key "$API_KEY_ENC"); then
             die "解密失败：口令错误，或密文损坏"
@@ -690,6 +766,7 @@ do_env() {
         PASSPHRASE_FILE="${LLM_PASSPHRASE_FILE:-$(strip_quotes "$(cfg_get LLM_PASSPHRASE_FILE)")}"
         if [ -n "${LLM_PASSPHRASE:-}" ] || [ -n "$PASSPHRASE_ARG" ] \
             || [ -n "${PASSPHRASE_FILE:-}" ] || [ -t 0 ]; then
+            require_openssl
             need_passphrase ""
             KEY=$(decrypt_key "$API_KEY_ENC" 2>/dev/null) || KEY=""
             KEY_SOURCE="配置文件（已解密）"
@@ -697,6 +774,7 @@ do_env() {
     fi
     if [ -z "${KEY:-}" ] && [ -n "${LLM_API_KEY:-}" ]; then
         KEY=$LLM_API_KEY
+        unset LLM_API_KEY   # 读到就摘：别让它跟着子进程走
         KEY_SOURCE="环境变量 LLM_API_KEY"
     fi
     printf '配置文件 : %s\n' "$CONFIG"

@@ -2,10 +2,12 @@
 
 > 把"LLM 端点连不上"拆成四层来查：网络 → 认证 → 推理 → SDK。
 > 两个零第三方依赖的实现（Python 标准库 / 纯 `curl` + `openssl`），退出码直接给结论，密钥加密存进 env 配置文件。
+> 需要验证 OpenAI 兼容能力时，再显式运行五项 `--matrix` 能力矩阵。
 
 A layered connectivity prober for OpenAI-compatible LLM endpoints. Two dependency-free
 implementations (Python stdlib and POSIX `curl`+`openssl`) that share one config file,
-one ciphertext format and one exit-code contract.
+one ciphertext format and one exit-code contract. An opt-in `--matrix` mode checks five
+OpenAI capability shapes without changing the default probe.
 
 ## 为什么
 
@@ -39,6 +41,10 @@ python3 llm_probe.py setkey
 # 3) 分层探测（口令来源见下面「密钥安全」的权衡表）
 python3 llm_probe.py probe                          # 不写 probe 也行
 ./llm_probe.sh probe --json                         # 同一份配置、同一种密文、同一套退出码
+
+# 可选：验证 chat / responses / streaming / tools / json_schema 五项兼容性
+python3 llm_probe.py probe --matrix --json
+./llm_probe.sh probe --matrix --json
 ```
 
 > `--key sk-xxx` / `--passphrase '口令'` 会留在 **shell 历史** 和 **`ps` 进程列表** 里，
@@ -67,15 +73,48 @@ print(resp.choices[0].message.content)
 
 分层诊断、退出码、`--json` 这些才是本工具的正题，demo 不重复实现。
 
-## 退出码
+## OpenAI 兼容能力矩阵
+
+`--matrix` 是显式的第二层工作流，不会改变普通 `probe` 的请求数量或报告结构。它针对同一组
+`(base_url, model, key)` 依次验证五个能力单元：
+
+1. `chat_completions`：非流式 Chat Completions，响应必须有非空文本；
+2. `responses_api`：`POST /responses`，支持 reasoning item 先于文本的响应；
+3. `streaming_sse`：`text/event-stream`、有效 chunk、文本 delta 和终止 `[DONE]`；
+4. `tool_calling`：现代 `tool_calls`、`finish_reason=tool_calls`、合法 JSON arguments；
+5. `json_schema`：`response_format.type=json_schema` 的严格固定 schema 输出。
+
+```bash
+python3 llm_probe.py probe --matrix
+python3 llm_probe.py probe --matrix --json > compatibility.json
+```
+
+矩阵使用固定的最小请求，不读取 `LLM_PROMPT` 改写探针提示词；`LLM_MAX_TOKENS` 和
+`LLM_TIMEOUT` 仍生效，因此最多可能发出五次生成请求。报告只保存能力结论，不保存模型原文、
+tool arguments 或 SSE body。404/405 表示该能力未实现，严格模式返回 `4`；`--allow-unsupported`
+只允许在 `chat_completions` 已通过时放宽这些可选能力，400、错误路径、全端点失败、网络、
+认证、限流和畸形 200 响应仍然失败。`--all` 可强制在认证/限流失败后继续发完剩余矩阵请求。
+
+`--json` 保留原有顶层字段，并增加：
+
+```json
+{
+  "mode": "compatibility",
+  "summary": {"passed": 5, "failed": 0, "skipped": 0, "total": 5},
+  "steps": [{"id": "chat_completions", "ok": true, "status": 200}]
+}
+```
+
+矩阵是能力验收，不是性能基准：它不计算 TTFT/TPOT，也不做并发压测。
+
 
 | 码 | 含义 | 典型证据 |
 |---|---|---|
-| `0` | 端点可用 | 推理层返回 200，报告里有回复 |
+| `0` | 端点可用 | 推理层返回 200；或矩阵全部通过/仅允许的未实现能力 |
 | `1` | 用法 / 配置错误 | base_url 非法、配置缺失、拿不到解密口令 |
 | `2` | 网络不可达 | DNS 失败、连接拒绝、超时、TLS 失败 |
 | `3` | 认证失败 | 401/403 无效的令牌、429 限流 |
-| `4` | 推理失败 | 400 模型名错、404 路径错、429 限流、5xx |
+| `4` | 推理 / 兼容失败 | 400 模型名错、404 路径错、429、5xx；矩阵能力不支持或响应畸形 |
 | `5` | SDK 层失败 | 仅 `probe --sdk` |
 
 ```bash
@@ -94,16 +133,16 @@ fi
 
 ```text
 llm-probe/
-├── llm_probe.py            # 1022 行，Python 3.7+，零第三方依赖，含 L4 SDK 层
-├── llm_probe.sh            # 921 行，严格 POSIX（dash 验证），只依赖 curl + openssl
+├── llm_probe.py            # 1490 行，Python 3.7+，零第三方依赖，含 L4 SDK 与兼容矩阵
+├── llm_probe.sh            # 1434 行，POSIX shell + 常见 userland 工具、curl + openssl
 ├── llm_probe.env.example   # 配置模板（init 会生成 .llm_probe.env，已 gitignore）
 ├── demo_minimal.py         # 97 行最简 demo：单次 SDK 调用
 ├── docs/                   # 完整技术文章（含两份源码逐行附录）
 ├── skill/                  # OpenCode skill 副本（正本在 ~/.config/opencode/skills/）
 ├── tests/
-│   ├── run_tests.sh        # 16 组场景、70 项断言（含 py/sh 跨实现 JSON/detail 一致性）
-│   ├── test_units.py       # 22 项单元测试：配置解析 / 加解密 / 结论映射 / 密钥卫生 / 退出码契约
-│   └── mock_llm.py         # 6 种故障模式的 mock 服务
+│   ├── run_tests.sh        # 17 组场景、145 项断言（含 py/sh probe 与矩阵 JSON 一致性）
+│   ├── test_units.py       # 27 项单元测试：配置 / 加解密 / 结论 / 矩阵解析 / 密钥卫生
+│   └── mock_llm.py         # 基础故障 + matrix_* 兼容变体的 mock 服务
 ├── README.md
 ├── .gitignore              # 忽略 .llm_probe.env、__pycache__
 └── .github/workflows/       # CI：push/PR 自动跑上面两套测试
@@ -113,14 +152,15 @@ llm-probe/
 
 ```bash
 ./tests/run_tests.sh        # 需 curl、openssl、python3；短暂占用 18923 端口
-# PASS=70 FAIL=0，退出码 0
-python3 tests/test_units.py # 22 项单元测试也能单独跑（或用 pytest）
+# PASS=145 FAIL=0，退出码 0
+python3 tests/test_units.py # 27 项单元测试也能单独跑（或用 pytest）
 ```
 
-16 组场景覆盖：正常端点、错误密钥、全站 401、路径 404、模型名 400、限流 429、
+17 组场景覆盖：正常端点、错误密钥、全站 401、路径 404、模型名 400、限流 429、
 `/models` 不实现、端口未监听、DNS 失败、非法 scheme、**密文双向互通**、
 **配置文件不被当代码执行**、**口令不泄漏给子进程**、**setkey 走 stdin**、
 **老 openssl 报错**、**py/sh 逐字段一致（退出码 + 步骤 + 结论 + L2/L3 detail + schema，6 种故障模式）**、
+**五项兼容矩阵**（支持、404、缺 `[DONE]`、坏 tool/schema、畸形 200、超大响应、连接重置、认证 gate、无 Python PATH）、
 **自查发现的缺陷回归**（退出码契约、0 值绕过校验、畸形配置、双引号剥离、`~` 展开、
 `--only net` 泄漏、优先级是否真的到了服务端……）。
 测试刻意不读取真实配置的解密口令。
@@ -148,6 +188,8 @@ macos 用系统 sh，顺带验证 BSD 用户态工具链），并检查 `.llm_pr
 - 密钥同理：`setkey` 支持从 **stdin 管道**读（`printf '%s' "$KEY" | ... setkey`），
   不进 argv、不进历史；`--key` 会打 stderr 警告。
 - 报告里只输出打码后的密钥 `sk-xxx********xxxx (len=N)`。
+- shell 版把 `Authorization` 写入临时私有 header 文件，再以 `curl -H @file` 读取；密钥不进入 curl argv / `ps`。
+- Python HTTP opener 拒绝跨 origin 重定向，避免把 bearer token 转发到第三方；shell 默认不跟随重定向。
 - 不只是"读到才摘"：选了 `--key` 就把环境里的 `LLM_API_KEY` 一并摘掉；
   `--only net` 这种**根本不读密钥**的路径也会摘——否则它照样会被 curl 继承。
 - **退出码契约不许被占用**：`2` 永远表示"网络不通"。参数拼错（argparse 默认退 2）、
@@ -164,6 +206,7 @@ macos 用系统 sh，顺带验证 BSD 用户态工具链），并检查 `.llm_pr
 | L1 报告 | 证书 CN、有效期、TLS 版本 | `remote_ip`、连接/握手耗时拆分（curl 拿不到证书链） |
 | `\uXXXX` 解码 | 原生 | 有 python3 时解码，没有就原样返回 |
 | L4 SDK | 支持 | 不支持（提示改用 py 版） |
+| `--matrix` | 支持五项 OpenAI 能力矩阵 | 支持同一矩阵，仍不依赖 Python |
 
 **其余全部逐字段一致**：退出码、每个步骤的 `ok`/`skipped`、结论文字、L2/L3 的 detail、
 `--json` 字段集合——由第 15 组测试在 6 种故障模式上逐项比对。
@@ -175,7 +218,7 @@ macos 用系统 sh，顺带验证 BSD 用户态工具链），并检查 `.llm_pr
 | 实现 | 要求 | 说明 |
 |---|---|---|
 | `llm_probe.py` | Python 3.7+，**零第三方依赖** | 装了 `cryptography` 会优先走它；否则回退 `openssl` CLI |
-| `llm_probe.sh` | POSIX shell（dash/bash/zsh）、`curl`、`openssl ≥ 1.1.1` | `-pbkdf2` 是 1.1.1 才加的；LibreSSL 不支持，启动时做功能探测并给出可读报错 |
+| `llm_probe.sh` | POSIX shell 语法（dash/bash/zsh）+ 常见 userland 工具、`curl`、`openssl ≥ 1.1.1` | `-pbkdf2` 是 1.1.1 才加的；LibreSSL 不支持，启动时做功能探测并给出可读报错 |
 
 配置文件、密文格式、退出码契约、`--json` 字段三者在两端**完全一致**，
 由 `tests/run_tests.sh` 第 15 组逐字段比对。
@@ -192,3 +235,5 @@ macos 用系统 sh，顺带验证 BSD 用户态工具链），并检查 `.llm_pr
 ## 边界
 
 不负责跑业务对话，不做多轮压测或 TPOT/TTFT 性能评测，也不判断模型真伪。
+`--matrix` 只验证固定的 OpenAI 兼容能力形状，不把能力通过解释成模型质量、供应商官方性或
+生产性能保证；benchmark、fingerprinting 和 agent readiness 仍属于后续工作。

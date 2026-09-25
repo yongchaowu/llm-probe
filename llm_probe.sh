@@ -20,6 +20,8 @@
 #   --base-url / --model / --prompt / --timeout / --max-tokens
 #   --only net|auth|infer    只跑某一层
 #   --all                    认证失败也继续测推理
+#   --matrix                 五项 OpenAI 兼容能力矩阵
+#   --allow-unsupported      chat 已通过时，矩阵中仅 404/405 未实现能力仍返回 0
 #   --direct                 不走系统代理
 #   --json                   JSON 输出
 
@@ -32,7 +34,7 @@
 # openssl → decrypt_key 的 if ! ... ），漏掉的靠 tests/run_tests.sh 兜底。
 set -u
 
-VERSION="1.0"
+VERSION="1.1"
 PROG="llm_probe.sh"
 ENC_PREFIX="enc:v1:"
 PBKDF2_ITER=300000
@@ -57,8 +59,12 @@ FORCE=0
 
 BODY_FILE=""
 ERR_FILE=""
+HEAD_FILE=""
+HEADER_FILE=""
 TMP_DIR=""
 PASSPHRASE=""
+MATRIX=0
+ALLOW_UNSUPPORTED=0
 
 # load_config 可能因配置文件缺失而提前返回，这些全局必须先初始化（set -u）
 API_KEY_ENC=""
@@ -83,6 +89,8 @@ cleanup() {
     [ -n "${TMP_DIR:-}" ] && rm -rf "$TMP_DIR"
     [ -n "$BODY_FILE" ] && rm -f "$BODY_FILE"
     [ -n "$ERR_FILE" ] && rm -f "$ERR_FILE"
+    [ -n "$HEAD_FILE" ] && rm -f "$HEAD_FILE"
+    [ -n "$HEADER_FILE" ] && rm -f "$HEADER_FILE"
 }
 # 收到信号要"清干净 + 立刻退出"：只 cleanup 不 exit 的话，脚本会从被打断的
 # 那一行继续往下跑，Ctrl-C 之后还可能打出一份半截报告。
@@ -100,8 +108,12 @@ init_tmpdir() {
     TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/llm_probe.XXXXXX") || die "mktemp -d 失败：无法创建临时目录"
     BODY_FILE="$TMP_DIR/response.json"
     ERR_FILE="$TMP_DIR/curl.err"
+    HEAD_FILE="$TMP_DIR/response.headers"
+    HEADER_FILE="$TMP_DIR/request.headers"
     : > "$BODY_FILE"
     : > "$ERR_FILE"
+    : > "$HEAD_FILE"
+    : > "$HEADER_FILE"
 }
 
 usage() {
@@ -126,17 +138,19 @@ $PROG $VERSION —— OpenAI 兼容 LLM 端点连通性探测（curl + openssl�
   --passphrase PWD  解密口令（同上；推荐口令文件或交互输入）
   --only LEVEL      只跑某一层: net=L1 / auth=L1+L2 / infer=L1+L3
   --all             认证失败也继续测推理
+  --matrix          五项 OpenAI 兼容能力矩阵
+  --allow-unsupported  chat 已通过时，矩阵中仅 404/405 未实现能力仍返回 0
   --direct          不走系统代理（绕过 http_proxy/https_proxy）
   --json            JSON 输出
 
 密钥选项:
   setkey            交互输入密钥（推荐）
-  printf '%s' "$K" | setkey     非交互：从 stdin 读，不进 argv / 历史
+  printf '%s' "\$K" | setkey     非交互：从 stdin 读，不进 argv / 历史
   setkey --key K    直接给密钥（会留在 shell 历史和 ps 进程列表里）
   setkey/showkey --passphrase P  口令直接给（同上；推荐口令文件或交互）
 
 退出码:
-  0 全部通过   1 用法/配置错误   2 网络不通   3 认证失败   4 推理失败
+  0 全部通过   1 用法/配置错误   2 网络不通   3 认证失败   4 推理/兼容失败
 
 示例:
   $PROG init
@@ -455,13 +469,21 @@ probe_net() {  # L1: DNS + TCP + TLS
     STEP1_DETAIL="DNS+TCP+TLS OK (${ms}ms) $ip（耗时: 连接 ${t_connect}s / 握手 ${t_tls}s）"
 }
 
+write_auth_header() {
+    : > "$HEADER_FILE"
+    if [ -n "$KEY" ]; then
+        printf 'Authorization: Bearer %s\n' "$KEY" > "$HEADER_FILE"
+    fi
+}
+
 probe_auth() {  # L2: GET /models
     STEP2_RAN=1
     opts=$(curl_common "$TIMEOUT")
     # shellcheck disable=SC2086
     set -- $opts
     if [ -n "$KEY" ]; then
-        out=$(curl "$@" -H "Authorization: Bearer $KEY" -H "Accept: application/json" \
+        write_auth_header
+        out=$(curl "$@" --header "@$HEADER_FILE" -H "Accept: application/json" \
             -o "$BODY_FILE" -w '%{http_code} %{time_total}' "$BASE_URL/models" 2>"$ERR_FILE")
     else
         out=$(curl "$@" -H "Accept: application/json" \
@@ -506,8 +528,8 @@ probe_infer() {  # L3: POST /chat/completions
     payload=$(printf '{"model":"%s","messages":[{"role":"user","content":"%s"}],"max_tokens":%s}' \
         "$(json_escape "$MODEL")" "$(json_escape "$PROMPT")" "$MAX_TOKENS")
     if [ -n "$KEY" ]; then
-        auth_header="Authorization: Bearer $KEY"
-        out=$(curl "$@" -H "$auth_header" -H "Content-Type: application/json" \
+        write_auth_header
+        out=$(curl "$@" --header "@$HEADER_FILE" -H "Content-Type: application/json" \
             -H "Accept: application/json" -d "$payload" \
             -o "$BODY_FILE" -w '%{http_code} %{time_total}' "$BASE_URL/chat/completions" 2>"$ERR_FILE")
     else
@@ -565,7 +587,21 @@ classify_curl_error() {  # 设置 LAST_CURL_MSG 与 CLASSIFY_KIND（勿在子 sh
 }
 
 json_escape() {
-    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g'
+    # JSON 字符串转义；逐字符处理，避免 awk gsub 对连续反斜杠的折叠。
+    printf '%s' "$1" | awk '
+        BEGIN { tab = sprintf("%c", 9); cr = sprintf("%c", 13) }
+        {
+            if (NR > 1) printf "\\n"
+            for (i = 1; i <= length($0); i++) {
+                c = substr($0, i, 1)
+                if (c == "\\") printf "\\\\"
+                else if (c == "\"") printf "\\\""
+                else if (c == tab) printf "\\t"
+                else if (c == cr) printf "\\r"
+                else printf "%s", c
+            }
+        }
+    '
 }
 
 json_unescape() {  # JSON 字符串里的 \uXXXX 解码；没有 python3 就原样返回
@@ -606,6 +642,466 @@ extract_usage() {  # 输出 "prompt/completion"（如 7/11）；响应里没有 
 
 ms_of() {  # 秒 → 毫秒（一位小数）
     awk -v s="$1" 'BEGIN{printf "%.1f", s*1000}'
+}
+
+# ---------------------------------------------------------------------------
+# OpenAI compatibility matrix（显式 --matrix 才执行）
+# ---------------------------------------------------------------------------
+MATRIX_IDS="chat_completions responses_api streaming_sse tool_calling json_schema"
+MATRIX_MAX_BODY_BYTES=2097152
+MATRIX_MAX_BODY_BLOCKS=4096
+MATRIX_CUR_ID=""
+MATRIX_CUR_NAME=""
+MATRIX_CUR_OK=false
+MATRIX_CUR_SKIPPED=false
+MATRIX_CUR_SUPPORTED=null
+MATRIX_CUR_STATUS=0
+MATRIX_CUR_KIND=null
+MATRIX_CUR_MS=0.0
+MATRIX_CUR_DETAIL=""
+
+matrix_name() {
+    case $1 in
+        chat_completions) printf '%s' "Chat Completions" ;;
+        responses_api) printf '%s' "Responses API" ;;
+        streaming_sse) printf '%s' "Streaming SSE" ;;
+        tool_calling) printf '%s' "Tool Calling" ;;
+        json_schema) printf '%s' "JSON Schema" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+matrix_set_row() {  # $1 id $2 ok $3 skipped $4 supported $5 status $6 kind $7 ms $8 detail
+    MATRIX_CUR_ID=$1
+    MATRIX_CUR_NAME=$(matrix_name "$1")
+    MATRIX_CUR_OK=$2
+    MATRIX_CUR_SKIPPED=$3
+    MATRIX_CUR_SUPPORTED=$4
+    MATRIX_CUR_STATUS=$5
+    MATRIX_CUR_KIND=$6
+    MATRIX_CUR_MS=$7
+    MATRIX_CUR_DETAIL=$8
+}
+
+matrix_save_row() {
+    # 详情不写入原始响应；去掉 tab/换行，保证 POSIX read 的字段稳定。
+    detail=$(printf '%s' "$MATRIX_CUR_DETAIL" | tr '\t\r\n' '   ')
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$MATRIX_CUR_ID" "$MATRIX_CUR_NAME" "$MATRIX_CUR_OK" "$MATRIX_CUR_SKIPPED" \
+        "$MATRIX_CUR_SUPPORTED" "$MATRIX_CUR_STATUS" "$MATRIX_CUR_KIND" \
+        "$MATRIX_CUR_MS" "$detail" > "$TMP_DIR/matrix.$MATRIX_CUR_ID"
+}
+
+matrix_skip() {  # $1 id $2 detail $3 kind
+    matrix_set_row "$1" false true null 0 "${3:-null}" 0.0 \
+        "${2:-前置能力失败，已跳过（--all 可强制执行）}"
+    matrix_save_row
+}
+
+matrix_network_detail() {
+    case $1 in
+        dns) printf '%s' "DNS 解析失败（域名不存在或无网络）" ;;
+        timeout) printf '%s' "请求超时" ;;
+        refused) printf '%s' "连接被拒绝（端口没开）" ;;
+        tls) printf '%s' "TLS 失败" ;;
+        *) printf '%s' "网络错误" ;;
+    esac
+}
+
+matrix_http() {  # $1 url $2 payload $3 stream(0/1)
+    matrix_url=$1
+    matrix_request_payload=$2
+    matrix_stream=${3:-0}
+    : > "$BODY_FILE"
+    : > "$ERR_FILE"
+    : > "$HEAD_FILE"
+    opts=$(curl_common "$TIMEOUT")
+    # shellcheck disable=SC2086
+    set -- $opts
+    set -- "$@" --max-filesize "$MATRIX_MAX_BODY_BYTES"
+    if [ "$matrix_stream" = "1" ]; then
+        set -- "$@" --no-buffer
+    fi
+    if [ "$matrix_stream" = "1" ]; then
+        accept="Accept: text/event-stream"
+    else
+        accept="Accept: application/json"
+    fi
+    # shellcheck disable=SC2086
+    if [ -n "$KEY" ]; then
+        write_auth_header
+        out=$(
+            ulimit -f "$MATRIX_MAX_BODY_BLOCKS" 2>/dev/null || exit 126
+            curl "$@" -D "$HEAD_FILE" --header "@$HEADER_FILE" \
+                -H "Content-Type: application/json" -H "$accept" -d "$matrix_request_payload" \
+                -o "$BODY_FILE" -w '%{http_code} %{time_total}' "$matrix_url"
+        ) 2>"$ERR_FILE"
+    else
+        out=$(
+            ulimit -f "$MATRIX_MAX_BODY_BLOCKS" 2>/dev/null || exit 126
+            curl "$@" -D "$HEAD_FILE" -H "Content-Type: application/json" \
+                -H "$accept" -d "$matrix_request_payload" -o "$BODY_FILE" \
+                -w '%{http_code} %{time_total}' "$matrix_url"
+        ) 2>"$ERR_FILE"
+    fi
+    rc=$?
+    body_bytes=$(wc -c < "$BODY_FILE" | tr -d '[:space:]')
+    if [ $rc -ne 0 ]; then
+        if [ "$rc" -eq 63 ] || [ "$body_bytes" -ge "$MATRIX_MAX_BODY_BYTES" ] \
+            || grep -Eiq 'file.*(large|limit)|maximum file size' "$ERR_FILE"; then
+            MATRIX_CUR_OK=false
+            MATRIX_CUR_SKIPPED=false
+            MATRIX_CUR_SUPPORTED=false
+            matrix_status=${out%% *}
+            case $matrix_status in
+                ''|*[!0-9]*) matrix_status=0 ;;
+            esac
+            MATRIX_CUR_STATUS=$matrix_status
+            MATRIX_CUR_KIND=malformed
+            MATRIX_CUR_MS=0.0
+            if [ "$MATRIX_CUR_STATUS" = "200" ]; then
+                MATRIX_CUR_DETAIL="HTTP 200 但响应体超过大小上限"
+            else
+                MATRIX_CUR_DETAIL="HTTP ${MATRIX_CUR_STATUS:-0} 但响应体超过大小上限"
+            fi
+            return 1
+        fi
+        classify_curl_error
+        MATRIX_CUR_OK=false
+        MATRIX_CUR_SKIPPED=false
+        MATRIX_CUR_SUPPORTED=null
+        MATRIX_CUR_STATUS=0
+        MATRIX_CUR_KIND=$CLASSIFY_KIND
+        MATRIX_CUR_MS=0.0
+        MATRIX_CUR_DETAIL=$(matrix_network_detail "$CLASSIFY_KIND")
+        return 1
+    fi
+    if [ "$body_bytes" -ge "$MATRIX_MAX_BODY_BYTES" ]; then
+        MATRIX_CUR_OK=false
+        MATRIX_CUR_SKIPPED=false
+        MATRIX_CUR_SUPPORTED=false
+        matrix_status=${out%% *}
+        case $matrix_status in
+            ''|*[!0-9]*) matrix_status=0 ;;
+        esac
+        MATRIX_CUR_STATUS=$matrix_status
+        MATRIX_CUR_KIND=malformed
+        MATRIX_CUR_MS=$(ms_of "${out##* }")
+        MATRIX_CUR_DETAIL="HTTP ${MATRIX_CUR_STATUS:-0} 但响应体超过大小上限"
+        return 1
+    fi
+    MATRIX_CUR_STATUS=${out%% *}
+    MATRIX_CUR_MS=$(ms_of "${out##* }")
+    MATRIX_CUR_OK=false
+    MATRIX_CUR_SKIPPED=false
+    MATRIX_CUR_SUPPORTED=null
+    MATRIX_CUR_KIND=null
+    return 0
+}
+
+matrix_http_failure() {
+    MATRIX_CUR_OK=false
+    MATRIX_CUR_SKIPPED=false
+    MATRIX_CUR_SUPPORTED=false
+    case $MATRIX_CUR_STATUS in
+        401|403) MATRIX_CUR_KIND=auth; MATRIX_CUR_SUPPORTED=null; MATRIX_CUR_DETAIL="HTTP $MATRIX_CUR_STATUS：认证失败" ;;
+        3??) MATRIX_CUR_KIND=redirect; MATRIX_CUR_DETAIL="HTTP $MATRIX_CUR_STATUS：拒绝重定向" ;;
+        404|405) MATRIX_CUR_KIND=unsupported; MATRIX_CUR_DETAIL="HTTP $MATRIX_CUR_STATUS：该能力未实现或路径不支持" ;;
+        400) MATRIX_CUR_KIND=badrequest; MATRIX_CUR_DETAIL="HTTP 400：该能力不支持或请求被拒绝" ;;
+        429) MATRIX_CUR_KIND=ratelimit; MATRIX_CUR_DETAIL="HTTP 429：限流 / 额度耗尽" ;;
+        *) if [ "$MATRIX_CUR_STATUS" -ge 500 ] 2>/dev/null; then
+                MATRIX_CUR_KIND=server; MATRIX_CUR_DETAIL="HTTP $MATRIX_CUR_STATUS：服务端错误"
+            else
+                MATRIX_CUR_KIND=client; MATRIX_CUR_DETAIL="HTTP $MATRIX_CUR_STATUS：异常响应"
+            fi ;;
+    esac
+}
+
+matrix_malformed() {
+    MATRIX_CUR_OK=false
+    MATRIX_CUR_SKIPPED=false
+    MATRIX_CUR_SUPPORTED=false
+    MATRIX_CUR_KIND=malformed
+    MATRIX_CUR_DETAIL="HTTP 200 但响应格式不符合 OpenAI 兼容约定"
+}
+
+matrix_compact() {
+    tr -d '[:space:]\\"' < "$BODY_FILE"
+}
+
+matrix_validate_chat() {
+    if [ "$MATRIX_CUR_STATUS" != "200" ]; then matrix_http_failure; return; fi
+    content=$(extract_content)
+    compact=$(matrix_compact)
+    if printf '%s' "$compact" | grep -Eq 'choices:\[\{.*message:\{.*content:[^,}]+' \
+        && [ -n "$content" ]; then
+        MATRIX_CUR_OK=true; MATRIX_CUR_SUPPORTED=true; MATRIX_CUR_KIND="null"
+        MATRIX_CUR_DETAIL="HTTP 200，chat.completions 返回可解析回复"
+    else
+        matrix_malformed
+    fi
+}
+
+matrix_validate_responses() {
+    if [ "$MATRIX_CUR_STATUS" != "200" ]; then matrix_http_failure; return; fi
+    compact=$(matrix_compact)
+    response_shape=0
+    if printf '%s' "$compact" | grep -Eq 'output:\[\{.*type:output_text,text:[^]]+\]'; then
+        response_shape=1
+    elif grep -Eq '"output_text"[[:space:]]*:[[:space:]]*"[^"]+"' "$BODY_FILE"; then
+        response_shape=1
+    fi
+    if grep -Eq '"object"[[:space:]]*:[[:space:]]*"response"' "$BODY_FILE" \
+        && grep -Eq '"status"[[:space:]]*:[[:space:]]*"completed"' "$BODY_FILE" \
+        && [ "$response_shape" -eq 1 ]; then
+        MATRIX_CUR_OK=true; MATRIX_CUR_SUPPORTED=true; MATRIX_CUR_KIND="null"
+        MATRIX_CUR_DETAIL="HTTP 200，Responses API 返回可解析输出"
+    else
+        matrix_malformed
+    fi
+}
+
+matrix_validate_sse() {
+    if [ "$MATRIX_CUR_STATUS" != "200" ]; then matrix_http_failure; return; fi
+    if ! grep -Eiq '^content-type:[[:space:]]*text/event-stream([[:space:]]*;|[[:space:]]*$)' "$HEAD_FILE" \
+        || ! grep -Eq '^[[:space:]]*data:[[:space:]]*\{' "$BODY_FILE" \
+        || ! grep -Eq '"object"[[:space:]]*:[[:space:]]*"chat.completion.chunk"' "$BODY_FILE" \
+        || ! grep -Eq '^[[:space:]]*data:[[:space:]]*\[DONE\][[:space:]]*$' "$BODY_FILE" \
+        || ! grep -Eq '"content"[[:space:]]*:[[:space:]]*"[^"]+"' "$BODY_FILE"; then
+        matrix_malformed
+        return
+    fi
+    MATRIX_CUR_OK=true; MATRIX_CUR_SUPPORTED=true; MATRIX_CUR_KIND="null"
+    MATRIX_CUR_DETAIL="HTTP 200，SSE 事件与 [DONE] 完整"
+}
+
+matrix_validate_tools() {
+    if [ "$MATRIX_CUR_STATUS" != "200" ]; then matrix_http_failure; return; fi
+    compact=$(matrix_compact)
+    if grep -Eq '"finish_reason"[[:space:]]*:[[:space:]]*"tool_calls"' "$BODY_FILE" \
+        && grep -Eq '"tool_calls"[[:space:]]*:[[:space:]]*\[[[:space:]]*\{' "$BODY_FILE" \
+        && grep -Eq '"name"[[:space:]]*:[[:space:]]*"llm_probe_lookup"' "$BODY_FILE" \
+        && grep -Eq '"arguments"[[:space:]]*:[[:space:]]*"' "$BODY_FILE" \
+        && printf '%s' "$compact" | grep -Eq 'tool_calls:\[\{[^}]*id:[^,}]+' \
+        && printf '%s' "$compact" | grep -Eq 'tool_calls:\[\{.*function:\{.*arguments:\{city:Paris\}'; then
+        MATRIX_CUR_OK=true; MATRIX_CUR_SUPPORTED=true; MATRIX_CUR_KIND="null"
+        MATRIX_CUR_DETAIL="HTTP 200，tool_calls、arguments 与 finish_reason 有效"
+    else
+        matrix_malformed
+    fi
+}
+
+matrix_validate_schema() {
+    if [ "$MATRIX_CUR_STATUS" != "200" ]; then matrix_http_failure; return; fi
+    # 固定 schema 只有 status=ok；去掉 JSON 转义引号后仍要求完整对象，不能把 okay 当成 ok。
+    compact=$(matrix_compact)
+    if ! grep -q '```' "$BODY_FILE" \
+        && grep -Eq '"content"[[:space:]]*:[[:space:]]*"' "$BODY_FILE" \
+        && printf '%s' "$compact" | grep -Eq 'choices:\[\{.*message:\{.*content:\{status:ok\}'; then
+        MATRIX_CUR_OK=true; MATRIX_CUR_SUPPORTED=true; MATRIX_CUR_KIND="null"
+        MATRIX_CUR_DETAIL="HTTP 200，JSON Schema 输出符合约定"
+    else
+        matrix_malformed
+    fi
+}
+
+matrix_payload() {  # $1 feature
+    case $1 in
+        chat_completions)
+            printf '{"model":"%s","messages":[{"role":"user","content":"Reply with exactly OK."}],"max_tokens":%s,"temperature":0}' \
+                "$(json_escape "$MODEL")" "$MAX_TOKENS" ;;
+        responses_api)
+            printf '{"model":"%s","input":"Reply with exactly OK.","max_output_tokens":%s,"temperature":0}' \
+                "$(json_escape "$MODEL")" "$MAX_TOKENS" ;;
+        streaming_sse)
+            printf '{"model":"%s","messages":[{"role":"user","content":"Reply with exactly OK."}],"max_tokens":%s,"temperature":0,"stream":true}' \
+                "$(json_escape "$MODEL")" "$MAX_TOKENS" ;;
+        tool_calling)
+            printf '{"model":"%s","messages":[{"role":"user","content":"Look up Paris using the tool."}],"max_tokens":%s,"temperature":0,"tools":[{"type":"function","function":{"name":"llm_probe_lookup","description":"Return the city for a fixed compatibility probe.","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false}}}],"tool_choice":{"type":"function","function":{"name":"llm_probe_lookup"}}}' \
+                "$(json_escape "$MODEL")" "$MAX_TOKENS" ;;
+        json_schema)
+            schema_prompt=$(json_escape 'Return exactly {"status":"ok"}.')
+            printf '{"model":"%s","messages":[{"role":"user","content":"%s"}],"max_tokens":%s,"temperature":0,"response_format":{"type":"json_schema","json_schema":{"name":"llm_probe_result","strict":true,"schema":{"type":"object","properties":{"status":{"type":"string","enum":["ok"]}},"required":["status"],"additionalProperties":false}}}}' \
+                "$(json_escape "$MODEL")" "$schema_prompt" "$MAX_TOKENS" ;;
+    esac
+}
+
+matrix_run_feature() {  # $1 id
+    matrix_base=$BASE_URL
+    while [ "${matrix_base%/}" != "$matrix_base" ]; do
+        matrix_base=${matrix_base%/}
+    done
+    case $1 in
+        chat_completions) url="$matrix_base/chat/completions"; stream=0 ;;
+        responses_api) url="$matrix_base/responses"; stream=0 ;;
+        streaming_sse) url="$matrix_base/chat/completions"; stream=1 ;;
+        tool_calling) url="$matrix_base/chat/completions"; stream=0 ;;
+        json_schema) url="$matrix_base/chat/completions"; stream=0 ;;
+        *) die "未知 matrix feature: $1" ;;
+    esac
+    payload=$(matrix_payload "$1")
+    if matrix_http "$url" "$payload" "$stream"; then
+        case $1 in
+            chat_completions) matrix_validate_chat ;;
+            responses_api) matrix_validate_responses ;;
+            streaming_sse) matrix_validate_sse ;;
+            tool_calling) matrix_validate_tools ;;
+            json_schema) matrix_validate_schema ;;
+        esac
+    fi
+    matrix_set_row "$1" "$MATRIX_CUR_OK" "$MATRIX_CUR_SKIPPED" \
+        "$MATRIX_CUR_SUPPORTED" "$MATRIX_CUR_STATUS" "$MATRIX_CUR_KIND" \
+        "$MATRIX_CUR_MS" "$MATRIX_CUR_DETAIL"
+    matrix_save_row
+}
+
+matrix_aggregate() {
+    MATRIX_PASSED=0; MATRIX_FAILED=0; MATRIX_SKIPPED=0
+    MATRIX_NETWORK_FOUND=0; MATRIX_AUTH_FOUND=0; MATRIX_OTHER_FOUND=0
+    MATRIX_SOFT_ONLY=1
+    MATRIX_CHAT_OK=0
+    MATRIX_FIRST_DETAIL=""; MATRIX_FIRST_ID=""; MATRIX_FAILED_IDS=""
+    for id in $MATRIX_IDS; do
+        [ -f "$TMP_DIR/matrix.$id" ] || continue
+        IFS="$(printf '\t')" read -r row_id row_name row_ok row_skipped row_supported row_status row_kind row_ms row_detail \
+            < "$TMP_DIR/matrix.$id"
+        if [ "$row_id" = "chat_completions" ] && [ "$row_ok" = "true" ]; then
+            MATRIX_CHAT_OK=1
+        fi
+        if [ "$row_skipped" = "true" ]; then
+            MATRIX_SKIPPED=$((MATRIX_SKIPPED + 1))
+            case $row_kind in
+                dns|timeout|refused|tls|net)
+                    MATRIX_NETWORK_FOUND=1
+                    [ -n "$MATRIX_FIRST_ID" ] || { MATRIX_FIRST_ID=$row_id; MATRIX_FIRST_DETAIL=$row_detail; }
+                    ;;
+            esac
+        elif [ "$row_ok" = "true" ]; then
+            MATRIX_PASSED=$((MATRIX_PASSED + 1))
+        else
+            MATRIX_FAILED=$((MATRIX_FAILED + 1))
+            [ -n "$MATRIX_FIRST_ID" ] || { MATRIX_FIRST_ID=$row_id; MATRIX_FIRST_DETAIL=$row_detail; }
+            if [ -n "$MATRIX_FAILED_IDS" ]; then MATRIX_FAILED_IDS="${MATRIX_FAILED_IDS}、"; fi
+            MATRIX_FAILED_IDS="${MATRIX_FAILED_IDS}${row_id}"
+            case $row_kind in
+                dns|timeout|refused|tls|net) MATRIX_NETWORK_FOUND=1 ;;
+                auth) MATRIX_AUTH_FOUND=1 ;;
+                unsupported) ;;
+                badrequest) MATRIX_OTHER_FOUND=1; MATRIX_SOFT_ONLY=0 ;;
+                *) MATRIX_OTHER_FOUND=1; MATRIX_SOFT_ONLY=0 ;;
+            esac
+        fi
+    done
+    if [ "$MATRIX_NETWORK_FOUND" -eq 1 ]; then
+        MATRIX_EXIT=2
+        MATRIX_VERDICT="网络不可达：$MATRIX_FIRST_DETAIL"
+    elif [ "$MATRIX_AUTH_FOUND" -eq 1 ]; then
+        MATRIX_EXIT=3
+        MATRIX_VERDICT="认证失败：$MATRIX_FIRST_DETAIL"
+    elif [ "$MATRIX_FAILED" -gt 0 ] && { [ "$MATRIX_OTHER_FOUND" -eq 1 ] || [ "$ALLOW_UNSUPPORTED" -eq 0 ] || [ "$MATRIX_CHAT_OK" -eq 0 ]; }; then
+        MATRIX_EXIT=4
+        MATRIX_VERDICT="兼容能力不通过：$MATRIX_FAILED_IDS"
+    elif [ "$MATRIX_FAILED" -gt 0 ]; then
+        MATRIX_EXIT=0
+        MATRIX_VERDICT="兼容能力通过（未实现：$MATRIX_FAILED_IDS）"
+    elif [ "$MATRIX_CHAT_OK" -eq 0 ]; then
+        MATRIX_EXIT=4
+        MATRIX_VERDICT="兼容能力不通过：chat_completions"
+    else
+        MATRIX_EXIT=0
+        MATRIX_VERDICT="兼容能力通过：5 项"
+    fi
+}
+
+matrix_json_bool() { [ "$1" = "true" ] && printf '%s' true || printf '%s' false; }
+matrix_json_kind() { [ "$1" = "null" ] && printf '%s' null || printf '"%s"' "$(json_escape "$1")"; }
+
+matrix_print_json() {
+    if [ -f "$CONFIG" ]; then config_json="\"$(json_escape "$CONFIG")\""; else config_json=null; fi
+    printf '{\n'
+    printf '  "version": "%s",\n' "$VERSION"
+    printf '  "mode": "compatibility",\n'
+    printf '  "base_url": "%s",\n' "$(json_escape "$BASE_URL")"
+    printf '  "model": "%s",\n' "$(json_escape "$MODEL")"
+    printf '  "key_masked": "%s",\n' "$(json_escape "$(mask_key "$KEY")")"
+    printf '  "key_source": "%s",\n' "$(json_escape "$KEY_SOURCE")"
+    printf '  "config": %s,\n' "$config_json"
+    printf '  "steps": [\n'
+    first=1
+    for id in $MATRIX_IDS; do
+        [ -f "$TMP_DIR/matrix.$id" ] || continue
+        IFS="$(printf '\t')" read -r row_id row_name row_ok row_skipped row_supported row_status row_kind row_ms row_detail \
+            < "$TMP_DIR/matrix.$id"
+        [ "$first" -eq 1 ] || printf ',\n'
+        first=0
+        printf '    {"id": "%s", "name": "%s", "ok": %s, "skipped": %s, "supported": %s, "status": %s, "kind": %s, "ms": %s, "detail": "%s"}' \
+            "$(json_escape "$row_id")" "$(json_escape "$row_name")" \
+            "$(matrix_json_bool "$row_ok")" "$(matrix_json_bool "$row_skipped")" \
+            "$row_supported" "$row_status" "$(matrix_json_kind "$row_kind")" "$row_ms" "$(json_escape "$row_detail")"
+    done
+    printf '\n  ],\n'
+    printf '  "summary": {"passed": %s, "failed": %s, "skipped": %s, "total": 5},\n' \
+        "$MATRIX_PASSED" "$MATRIX_FAILED" "$MATRIX_SKIPPED"
+    printf '  "verdict": "%s",\n' "$(json_escape "$MATRIX_VERDICT")"
+    printf '  "exit_code": %s\n}\n' "$MATRIX_EXIT"
+}
+
+matrix_print_human() {
+    printf '%s\n' "============================================================"
+    printf '端点   : %s\n' "$BASE_URL"
+    printf '模型   : %s\n' "$MODEL"
+    printf '密钥   : %s  [%s]\n' "$(mask_key "$KEY")" "$KEY_SOURCE"
+    printf '%s\n' "------------------------------------------------------------"
+    n=1
+    for id in $MATRIX_IDS; do
+        [ -f "$TMP_DIR/matrix.$id" ] || continue
+        IFS="$(printf '\t')" read -r row_id row_name row_ok row_skipped row_supported row_status row_kind row_ms row_detail \
+            < "$TMP_DIR/matrix.$id"
+        if [ "$row_skipped" = "true" ]; then mark="SKIP"
+        elif [ "$row_ok" = "true" ]; then mark="OK  "
+        else mark="FAIL"; fi
+        printf '[%s] %s [%s/5]  %s\n' "$mark" "$row_name" "$n" "$row_detail"
+        n=$((n + 1))
+    done
+    printf '%s\n' "------------------------------------------------------------"
+    printf '矩阵   : %s 通过 / %s 失败 / %s 跳过 / 5 总计\n' \
+        "$MATRIX_PASSED" "$MATRIX_FAILED" "$MATRIX_SKIPPED"
+    if [ "$MATRIX_EXIT" -eq 0 ]; then mark="✅"; else mark="❌"; fi
+    printf '结论 %s %s\n' "$mark" "$MATRIX_VERDICT"
+    printf '退出码 %s\n' "$MATRIX_EXIT"
+    printf '%s\n' "============================================================"
+}
+
+run_matrix() {
+    [ -n "$BASE_URL" ] || die "缺少 base_url：用 --base-url 或在配置里填 LLM_BASE_URL"
+    [ -n "$MODEL" ] || die "缺少模型名：用 --model 或在配置里填 LLM_MODEL"
+    case $BASE_URL in
+        http://*|https://*) ;;
+        *) die "base_url 非法（需要 http(s)://host[/v1]）: $BASE_URL" ;;
+    esac
+    resolve_key
+    init_tmpdir
+    probe_net
+    if [ "$STEP1_OK" -eq 0 ]; then
+        for id in $MATRIX_IDS; do matrix_skip "$id" "$STEP1_DETAIL" "$STEP1_KIND"; done
+    else
+        gated=0
+        for id in $MATRIX_IDS; do
+            if [ "$gated" -eq 1 ] && [ "$ALL" -eq 0 ]; then
+                matrix_skip "$id"
+            else
+                matrix_run_feature "$id"
+                if [ "$ALL" -eq 0 ] && [ "$MATRIX_CUR_OK" = "false" ]; then
+                    case $MATRIX_CUR_KIND in
+                        dns|timeout|refused|tls|net|auth|ratelimit) gated=1 ;;
+                    esac
+                fi
+            fi
+        done
+    fi
+    matrix_aggregate
+    if [ "$JSON" = "1" ]; then matrix_print_json; else matrix_print_human; fi
+    return "$MATRIX_EXIT"
 }
 
 # ---------------------------------------------------------------------------
@@ -694,7 +1190,11 @@ run_probe() {
         printf '  "model": "%s",\n' "$(json_escape "$MODEL")"
         printf '  "key_masked": "%s",\n' "$(json_escape "$(mask_key "$KEY")")"
         printf '  "key_source": "%s",\n' "$(json_escape "$KEY_SOURCE")"
-        printf '  "config": "%s",\n' "$(json_escape "$CONFIG")"
+        if [ -f "$CONFIG" ]; then
+            printf '  "config": "%s",\n' "$(json_escape "$CONFIG")"
+        else
+            printf '  "config": null,\n'
+        fi
         printf '  "steps": [\n'
         printf '    {"name": "L1 网络", "ok": %s, "detail": "%s"}' \
             "$([ "$STEP1_OK" -eq 1 ] && echo true || echo false)" "$(json_escape "$STEP1_DETAIL")"
@@ -876,6 +1376,8 @@ parse_args() {
             --passphrase)[ $# -ge 2 ] || die "缺少 $1 的值"; PASSPHRASE_ARG=$2; shift 2 ;;
             --only)      [ $# -ge 2 ] || die "缺少 $1 的值"; ONLY=$2; shift 2 ;;
             --all)       ALL=1; shift ;;
+            --matrix)    MATRIX=1; shift ;;
+            --allow-unsupported) ALLOW_UNSUPPORTED=1; shift ;;
             --direct)    DIRECT=1; shift ;;
             --json)      JSON=1; shift ;;
             --plain)     PLAIN=1; shift ;;
@@ -895,6 +1397,15 @@ parse_args() {
         sdk) die "sh 版没有 openai SDK 层，请用: python3 llm_probe.py probe --sdk" ;;
         *)   die "--only 只接受 net / auth / infer" ;;
     esac
+    if [ "$MATRIX" -eq 1 ] && [ -n "$ONLY" ]; then
+        die "--matrix 不能与 --only 同时使用"
+    fi
+    if [ "$MATRIX" -eq 1 ] && [ "$CMD" != "probe" ]; then
+        die "--matrix 只能与 probe 子命令一起使用"
+    fi
+    if [ "$ALLOW_UNSUPPORTED" -eq 1 ] && [ "$MATRIX" -ne 1 ]; then
+        die "--allow-unsupported 只能与 --matrix 同时使用"
+    fi
 }
 
 main() {
@@ -910,7 +1421,9 @@ main() {
     validate_options    # CLI 值是刚套用的，必须在这里再校验一次
 
     case $CMD in
-        probe)   run_probe ;;
+        probe)
+            if [ "$MATRIX" -eq 1 ]; then run_matrix; else run_probe; fi
+            ;;
         init)    do_init ;;
         setkey)  do_setkey ;;
         showkey) do_showkey ;;

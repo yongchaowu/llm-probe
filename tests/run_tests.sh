@@ -1,7 +1,7 @@
 #!/bin/sh
-# llm_probe 分支测试：mock 服务 + py/sh 双实现，16 组场景、70 项断言
+# llm_probe 分支测试：mock 服务 + py/sh 双实现，含四层 probe 与兼容矩阵
 # 用法: ./run_tests.sh          （需 curl、openssl、python3；会短暂占用 18923 端口）
-# 全部通过时输出 PASS=70 FAIL=0，退出码 0
+# 全部通过时输出 PASS=... FAIL=0，退出码 0
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_DIR=$(dirname "$SCRIPT_DIR")
 LOGDIR=$(mktemp -d)
@@ -39,6 +39,31 @@ check() {  # $1=描述 $2=期望退出码 $3=实际
     else
         FAIL=$((FAIL + 1)); printf '  ❌ %-46s 期望 exit=%s 实际=%s\n' "$1" "$2" "$3"
     fi
+}
+
+compare_matrix() {  # $1=py JSON $2=sh JSON $3=py process code $4=sh process code
+    python3 - "$1" "$2" "$3" "$4" <<'PY'
+import json, sys
+py = json.load(open(sys.argv[1], encoding="utf-8"))
+sh = json.load(open(sys.argv[2], encoding="utf-8"))
+for data in (py, sh):
+    for step in data["steps"]:
+        step.pop("ms", None)
+expected_ids = ["chat_completions", "responses_api", "streaming_sse", "tool_calling", "json_schema"]
+problems = []
+if py.get("mode") != "compatibility" or sh.get("mode") != "compatibility":
+    problems.append("mode")
+if [s.get("id") for s in py["steps"]] != expected_ids or [s.get("id") for s in sh["steps"]] != expected_ids:
+    problems.append("step ids/order")
+if py != sh:
+    problems.append("JSON fields differ")
+if int(sys.argv[3]) != py.get("exit_code") or int(sys.argv[4]) != sh.get("exit_code"):
+    problems.append("process/result exit mismatch")
+if problems:
+    print("; ".join(problems))
+    sys.exit(1)
+sys.exit(0)
+PY
 }
 
 echo "== 1. 正常端点 (mock ok) =="
@@ -134,6 +159,8 @@ check "py 非法 scheme → 1" 1 $?
 check "sh 非法 scheme → 1" 1 $?
 python3 llm_probe.py --only net --base-url http://127.0.0.1:18999/v1 >/dev/null 2>&1
 check "py --only net 端口不通 → 2" 2 $?
+./llm_probe.sh --help >/dev/null 2>&1
+check "sh --help 不因未定义示例变量退出" 0 $?
 
 echo "== 9. 密文互通 =="
 TMPDIR_T=$(mktemp -d)
@@ -385,17 +412,29 @@ mkdir -p "$KEYSHIM"
 cat > "$KEYSHIM/curl" <<SHIMEOF
 #!/bin/sh
 env | grep -c '^LLM_API_KEY=' >> "$LOGDIR/curl_key"
-exec $REAL_CURL "$@"
+for arg in "\$@"; do
+    case "\$arg" in
+        *sk-cli-arg*|*sk-env-should-be-scrubbed*) echo leaked >> "$LOGDIR/curl_argv_leak"; exit 97 ;;
+    esac
+done
+exec $REAL_CURL "\$@"
 SHIMEOF
 chmod +x "$KEYSHIM/curl"
-rm -f "$LOGDIR/curl_key"
+rm -f "$LOGDIR/curl_key" "$LOGDIR/curl_argv_leak"
 LLM_API_KEY='sk-env-should-be-scrubbed' PATH="$KEYSHIM:$PATH" \
-    ./llm_probe.sh -c "$REG/probe.env" probe --only net --key 'sk-cli-arg' >/dev/null 2>&1
+    ./llm_probe.sh -c "$REG/probe.env" probe --only auth --key 'sk-cli-arg' >/dev/null 2>&1
 # 先确认 curl 真的跑起来了，否则"没泄漏"是假通过
 [ -f "$LOGDIR/curl_key" ] && RC=0 || RC=1
 check "sh curl 子进程确实被执行（防止假通过）" 0 $RC
 grep -q '^[1-9]' "$LOGDIR/curl_key" 2>/dev/null && RC=1 || RC=0
 check "sh --key 时环境 key 不传子进程" 0 $RC
+[ ! -f "$LOGDIR/curl_argv_leak" ] && RC=0 || RC=1
+check "sh API key 不出现在 curl argv" 0 $RC
+rm -f "$LOGDIR/curl_argv_leak"
+LLM_API_KEY='sk-env-should-be-scrubbed' PATH="$KEYSHIM:$PATH" \
+    ./llm_probe.sh -c "$REG/probe.env" probe --only auth >/dev/null 2>&1
+[ ! -f "$LOGDIR/curl_argv_leak" ] && RC=0 || RC=1
+check "sh 环境 API key 不出现在 curl argv" 0 $RC
 LLM_API_KEY='sk-env-should-be-scrubbed' python3 - >/dev/null 2>&1 <<'PY'
 import os, sys
 sys.path.insert(0, ".")
@@ -447,6 +486,118 @@ python3 llm_probe.py -c "$REG/pri.env" probe --base-url "$BASE_URL" --model mock
 check "py 命令行 max_tokens 覆盖配置" 0 $?
 stop_mock
 rm -rf "$REG"
+
+echo "== 17. OpenAI compatibility matrix =="
+for matrix_case in ok matrix_unsupported_responses matrix_missing_done matrix_bad_tool matrix_bad_schema matrix_bad_schema_prefix matrix_bad_chat_empty matrix_bad_responses_empty matrix_fake_done matrix_bad_tool_extra matrix_bad_tool_empty_id matrix_malformed_chat matrix_malformed_responses matrix_reset matrix_large badpath badmodel unauthorized; do
+    case $matrix_case in
+        ok) expected=0 ;;
+        unauthorized) expected=3 ;;
+        matrix_reset) expected=2 ;;
+        *) expected=4 ;;
+    esac
+    start_mock "$matrix_case"
+    python3 llm_probe.py probe --base-url "$BASE_URL" --model mock-a --key sk-good \
+        --matrix --json >"$LOGDIR"/matrix-py.json 2>/dev/null
+    ARC=$?
+    ./llm_probe.sh probe --base-url "$BASE_URL" --model mock-a --key sk-good \
+        --matrix --json >"$LOGDIR"/matrix-sh.json 2>/dev/null
+    BRC=$?
+    check "$matrix_case: py matrix exit" "$expected" "$ARC"
+    check "$matrix_case: sh matrix exit" "$expected" "$BRC"
+    compare_matrix "$LOGDIR"/matrix-py.json "$LOGDIR"/matrix-sh.json "$ARC" "$BRC"
+    check "$matrix_case: py/sh matrix JSON 一致" 0 $?
+    stop_mock
+done
+
+# 末尾斜杠只能产生一个分隔符；py/sh 必须发出同样的路径。
+start_mock ok
+python3 llm_probe.py probe --base-url "$BASE_URL/" --model mock-a --key sk-good \
+    --matrix --json >"$LOGDIR"/matrix-slash-py.json 2>/dev/null
+ARC=$?
+./llm_probe.sh probe --base-url "$BASE_URL/" --model mock-a --key sk-good \
+    --matrix --json >"$LOGDIR"/matrix-slash-sh.json 2>/dev/null
+BRC=$?
+check "py matrix trailing slash" 0 $ARC
+check "sh matrix trailing slash" 0 $BRC
+compare_matrix "$LOGDIR"/matrix-slash-py.json "$LOGDIR"/matrix-slash-sh.json "$ARC" "$BRC"
+check "trailing slash: py/sh JSON 一致" 0 $?
+stop_mock
+
+# 404/405/400 是“能力未实现”时，可显式选择不让它阻断发布门禁。
+start_mock matrix_unsupported_responses
+python3 llm_probe.py probe --base-url "$BASE_URL" --model mock-a --key sk-good \
+    --matrix --allow-unsupported >/dev/null 2>&1
+check "py --allow-unsupported 未实现能力仍为 0" 0 $?
+./llm_probe.sh probe --base-url "$BASE_URL" --model mock-a --key sk-good \
+    --matrix --allow-unsupported >/dev/null 2>&1
+check "sh --allow-unsupported 未实现能力仍为 0" 0 $?
+stop_mock
+start_mock badpath
+python3 llm_probe.py probe --base-url "$BASE_URL" --model mock-a --key sk-good \
+    --matrix --allow-unsupported >/dev/null 2>&1
+check "py 不允许全端点 404 被放行" 4 $?
+./llm_probe.sh probe --base-url "$BASE_URL" --model mock-a --key sk-good \
+    --matrix --allow-unsupported >/dev/null 2>&1
+check "sh 不允许全端点 404 被放行" 4 $?
+stop_mock
+start_mock badmodel
+python3 llm_probe.py probe --base-url "$BASE_URL" --model mock-a --key sk-good \
+    --matrix --allow-unsupported >/dev/null 2>&1
+check "py 不允许全端点 400 被放行" 4 $?
+./llm_probe.sh probe --base-url "$BASE_URL" --model mock-a --key sk-good \
+    --matrix --allow-unsupported >/dev/null 2>&1
+check "sh 不允许全端点 400 被放行" 4 $?
+stop_mock
+
+# shell 矩阵不能偷偷依赖 python3；用只含 POSIX 工具的 PATH 跑一遍。
+start_mock ok
+NOPY_BIN="$LOGDIR/nopy-bin"
+mkdir -p "$NOPY_BIN"
+for nopy_cmd in curl awk sed grep tr wc cut rev head tail mktemp rm dirname; do
+    ln -s "$(command -v "$nopy_cmd")" "$NOPY_BIN/$nopy_cmd"
+done
+PATH="$NOPY_BIN" /bin/sh ./llm_probe.sh probe --base-url "$BASE_URL" --model mock-a \
+    --key sk-good --matrix --json >"$LOGDIR"/matrix-nopy.json 2>"$LOGDIR"/matrix-nopy.err
+check "sh matrix 无 Python PATH 仍可运行" 0 $?
+stop_mock
+
+# 认证失败默认只发第一项，后续行明确标记 skipped；不把 401 误报成兼容性失败。
+start_mock unauthorized
+python3 llm_probe.py probe --base-url "$BASE_URL" --model mock-a --key sk-good \
+    --matrix --json >"$LOGDIR"/matrix-auth.json 2>/dev/null
+python3 - "$LOGDIR"/matrix-auth.json <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+assert d["exit_code"] == 3
+assert d["summary"] == {"passed": 0, "failed": 1, "skipped": 4, "total": 5}
+PY
+check "py 认证失败矩阵 gate/summary" 0 $?
+./llm_probe.sh probe --base-url "$BASE_URL" --model mock-a --key sk-good \
+    --matrix --json >"$LOGDIR"/matrix-auth-sh.json 2>/dev/null
+python3 - "$LOGDIR"/matrix-auth-sh.json <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+assert d["exit_code"] == 3
+assert d["summary"] == {"passed": 0, "failed": 1, "skipped": 4, "total": 5}
+PY
+check "sh 认证失败矩阵 gate/summary" 0 $?
+stop_mock
+
+# 网络前置失败仍是退出码 2，参数冲突仍是用法错误 1。
+python3 llm_probe.py probe --base-url http://127.0.0.1:18999/v1 --model mock-a \
+    --key sk-good --matrix >/dev/null 2>&1
+check "py matrix 网络失败 → 2" 2 $?
+./llm_probe.sh probe --base-url http://127.0.0.1:18999/v1 --model mock-a \
+    --key sk-good --matrix >/dev/null 2>&1
+check "sh matrix 网络失败 → 2" 2 $?
+python3 llm_probe.py probe --matrix --only net >/dev/null 2>&1
+check "py --matrix 与 --only 冲突 → 1" 1 $?
+./llm_probe.sh probe --matrix --only net >/dev/null 2>&1
+check "sh --matrix 与 --only 冲突 → 1" 1 $?
+python3 llm_probe.py probe --allow-unsupported >/dev/null 2>&1
+check "py --allow-unsupported 非 matrix → 1" 1 $?
+./llm_probe.sh probe --allow-unsupported >/dev/null 2>&1
+check "sh --allow-unsupported 非 matrix → 1" 1 $?
 
 echo
 echo "=================================="

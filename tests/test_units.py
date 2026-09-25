@@ -353,7 +353,7 @@ def test_only_net_scrubs_api_key_env():
 # ---------------------------------------------------------------------------
 def test_json_schema_parity():
     result = {
-        "version": "1.0",
+        "version": "1.1",
         "base_url": "https://api.openai.com/v1",
         "model": "gpt-4o-mini",
         "key_masked": "sk-1********abc2 (len=16)",
@@ -389,6 +389,110 @@ def test_default_config_template_uses_official_endpoint():
     model = [ln for ln in text.splitlines() if ln.startswith("LLM_MODEL=")]
     assert base and base[0] == "LLM_BASE_URL=https://api.openai.com/v1", base
     assert model and model[0] == "LLM_MODEL=gpt-4o-mini", model
+
+
+# ---------------------------------------------------------------------------
+# OpenAI compatibility matrix
+# ---------------------------------------------------------------------------
+def test_redirect_handler_rejects_cross_origin_authorization_forwarding():
+    handler = llm_probe._SameOriginRedirectHandler()
+    request = llm_probe.urllib.request.Request(
+        "http://example.test/v1/models", headers={"Authorization": "Bearer secret"})
+    assert handler.redirect_request(
+        request, None, 302, "Found", {}, "http://other.test/steal") is None
+
+
+def test_matrix_parsers_accept_minimal_supported_responses():
+    responses = {
+        "object": "response", "status": "completed",
+        "output": [
+            {"type": "reasoning", "summary": []},
+            {"type": "message", "content": [{"type": "output_text", "text": "OK"}]},
+        ],
+    }
+    assert llm_probe.parse_responses_object(responses) == "OK"
+    chat = {"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]}
+    assert llm_probe.parse_chat_completion(chat)[0] == "OK"
+    tool = {"choices": [{"finish_reason": "tool_calls", "message": {"tool_calls": [{
+        "id": "call-1", "type": "function",
+        "function": {"name": llm_probe.MATRIX_TOOL_NAME,
+                     "arguments": '{"city":"Paris"}'},
+    }]}}]}
+    assert llm_probe.parse_tool_call(tool)["id"] == "call-1"
+    schema = {"choices": [{"message": {"content": '{"status":"ok"}'}}]}
+    assert llm_probe.parse_schema_output(schema) == {"status": "ok"}
+    events, text = llm_probe.parse_sse_events(
+        b': keepalive\r\ndata: {"object":"chat.completion.chunk",'
+        b'"choices":[{"delta":{"content":"O"}}]}\r\n\r\n'
+        b'data: {"object":"chat.completion.chunk",'
+        b'"choices":[{"delta":{"content":"K"}}]}\r\n\r\n'
+        b'data: [DONE]\r\n\r\n')
+    assert len(events) == 2 and text == "OK"
+
+
+def test_matrix_parsers_reject_malformed_capabilities():
+    for fn, value in (
+        (llm_probe.parse_chat_completion, {"choices": []}),
+        (llm_probe.parse_responses_object, {"object": "response", "status": "incomplete"}),
+        (llm_probe.parse_tool_call, {"choices": [{"finish_reason": "stop",
+                                                  "message": {"function_call": {}}}]}),
+        (llm_probe.parse_schema_output, {"choices": [{"message": {"content": "not-json"}}]}),
+    ):
+        try:
+            fn(value)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{fn.__name__} 接受了非法响应")
+    try:
+        llm_probe.parse_sse_events(b"data: {not-json}\n\ndata: [DONE]\n\n")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("parse_sse_events 接受了非法 data")
+    try:
+        llm_probe.parse_sse_events(
+            b': keepalive\r\ndata: {"object":"chat.completion.chunk",'
+            b'"choices":[{"delta":{"content":"OK"}}]}\r\n\r\n')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("parse_sse_events 接受了缺少 [DONE] 的流")
+
+
+def test_matrix_verdict_precedence_and_allow_unsupported():
+    good = {"id": "chat_completions", "ok": True, "skipped": False}
+    unsupported = {"id": "responses_api", "ok": False, "skipped": False,
+                   "kind": "unsupported", "detail": "unsupported"}
+    auth = {"id": "chat_completions", "ok": False, "skipped": False,
+            "kind": "auth", "detail": "unauthorized"}
+    network = {"id": "chat_completions", "ok": False, "skipped": True,
+               "kind": "timeout", "detail": "timeout"}
+    assert llm_probe.matrix_verdict([good])[0] == 0
+    assert llm_probe.matrix_verdict([good, unsupported])[0] == 4
+    assert llm_probe.matrix_verdict([good, unsupported], allow_unsupported=True)[0] == 0
+    all_unsupported = [dict(unsupported, id="chat_completions"),
+                       dict(unsupported, id="responses_api")]
+    assert llm_probe.matrix_verdict(all_unsupported, allow_unsupported=True)[0] == 4
+    badrequest = {"id": "responses_api", "ok": False, "skipped": False,
+                  "kind": "badrequest", "detail": "bad request"}
+    assert llm_probe.matrix_verdict([good, badrequest], allow_unsupported=True)[0] == 4
+    assert llm_probe.matrix_verdict([auth])[0] == 3
+    assert llm_probe.matrix_verdict([network])[0] == 2
+    code, verdict, summary = llm_probe.matrix_verdict([good, unsupported])
+    assert summary == {"passed": 1, "failed": 1, "skipped": 0, "total": 2}
+    assert "responses_api" in verdict and code == 4
+
+
+def test_matrix_flag_conflict_is_usage_error():
+    args = llm_probe.build_parser().parse_args(["probe", "--matrix", "--only", "net"])
+    saved = sys.stderr
+    try:
+        sys.stderr = io.StringIO()
+        code = llm_probe.cmd_probe(args)
+    finally:
+        sys.stderr = saved
+    assert code == 1
 
 
 # ---------------------------------------------------------------------------

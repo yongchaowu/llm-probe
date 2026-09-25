@@ -19,6 +19,7 @@
   L2 认证   GET  {base}/models
   L3 推理   POST {base}/chat/completions
   L4 SDK    真实 openai SDK 调用（--sdk 时执行，自动适配 0.x / 1.x）
+  --matrix  显式验证 chat/responses/streaming/tools/json_schema 五项兼容能力
 
 退出码
 ------
@@ -41,7 +42,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.0"
+VERSION = "1.1"
 
 # -- 加密参数：与 `openssl enc -aes-256-cbc -pbkdf2 -iter 300000 -md sha256`
 #    完全对齐，保证 Python 和 shell 两端互认对方的密文 -----------------------
@@ -376,6 +377,34 @@ def read_passphrase(args, cfg, *, confirm=False, allow_prompt=True):
 # ---------------------------------------------------------------------------
 # HTTP 基础设施
 # ---------------------------------------------------------------------------
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """允许同源跳转，拒绝把 Authorization 转发到另一 origin。"""
+
+    @staticmethod
+    def _origin(url):
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port or (443 if parts.scheme.lower() == "https" else 80)
+        return parts.scheme.lower(), (parts.hostname or "").lower(), port
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if self._origin(req.full_url) != self._origin(newurl):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_HTTP_OPENER_CONFIGURED = False
+
+
+def install_http_opener(direct=False):
+    """安装带同源重定向保护的 opener；direct 时同时禁用系统代理。"""
+    global _HTTP_OPENER_CONFIGURED
+    handlers = [_SameOriginRedirectHandler()]
+    if direct:
+        handlers.append(urllib.request.ProxyHandler({}))
+    urllib.request.install_opener(urllib.request.build_opener(*handlers))
+    _HTTP_OPENER_CONFIGURED = True
+
+
 def classify_error(exc):
     """把异常翻译成人类能看懂的网络结论。"""
     if isinstance(exc, urllib.error.URLError):
@@ -398,35 +427,61 @@ def classify_error(exc):
     return "net", f"{type(exc).__name__}: {exc}"
 
 
-def http_call(url, method="GET", headers=None, payload=None, timeout=30):
-    """发一次 HTTP 请求，永不抛异常，统一返回结构化结果。"""
+def http_call(url, method="GET", headers=None, payload=None, timeout=30, max_body_bytes=None):
+    """发一次 HTTP 请求，永不抛异常，统一返回结构化结果。
+
+    ``headers`` 被规范化为小写键名，兼容矩阵需要读取 Content-Type；普通 probe
+    不依赖这个扩展字段，原有返回结构保持不变。``max_body_bytes`` 用于限制
+    响应体，避免异常端点把探针变成无界内存消费者。
+    """
     body = None
     if payload is not None:
-        body = json.dumps(payload).encode("utf-8")
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=body, method=method)
     for key, value in (headers or {}).items():
         req.add_header(key, value)
     start = time.monotonic()
+    if not _HTTP_OPENER_CONFIGURED:
+        install_http_opener()
+
+    def read_body(response):
+        if max_body_bytes is None:
+            return response.read(), False
+        raw = response.read(max_body_bytes + 1)
+        return raw[:max_body_bytes], len(raw) > max_body_bytes
+
+    def response_headers(response):
+        try:
+            return {str(key).lower(): str(value) for key, value in response.getheaders()}
+        except Exception:
+            return {}
+
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
+            raw, truncated = read_body(resp)
+            elapsed = round((time.monotonic() - start) * 1000, 1)
             return {
-                "ok": True, "status": resp.status, "body": raw,
-                "ms": round((time.monotonic() - start) * 1000, 1), "error": None,
+                "ok": not truncated, "status": getattr(resp, "status", resp.getcode()),
+                "body": raw, "headers": response_headers(resp), "ms": elapsed,
+                "error": {"kind": "body_too_large", "message": "响应体超过大小上限"}
+                if truncated else None,
             }
     except urllib.error.HTTPError as exc:
         try:
-            raw = exc.read()
+            raw, truncated = read_body(exc)
         except Exception:
-            raw = b""
+            raw, truncated = b"", False
         return {
             "ok": False, "status": exc.code, "body": raw,
-            "ms": round((time.monotonic() - start) * 1000, 1), "error": None,
+            "headers": response_headers(exc),
+            "ms": round((time.monotonic() - start) * 1000, 1),
+            "error": {"kind": "body_too_large", "message": "响应体超过大小上限"}
+            if truncated else None,
         }
     except Exception as exc:
         kind, message = classify_error(exc)
         return {
-            "ok": False, "status": 0, "body": b"",
+            "ok": False, "status": 0, "body": b"", "headers": {},
             "ms": round((time.monotonic() - start) * 1000, 1),
             "error": {"kind": kind, "message": message},
         }
@@ -554,6 +609,382 @@ def step_infer(base_url, key, model, prompt, max_tokens, timeout):
     return step
 
 
+# ---------------------------------------------------------------------------
+# OpenAI compatibility matrix（显式 --matrix 才执行）
+# ---------------------------------------------------------------------------
+MATRIX_CELLS = (
+    ("chat_completions", "Chat Completions"),
+    ("responses_api", "Responses API"),
+    ("streaming_sse", "Streaming SSE"),
+    ("tool_calling", "Tool Calling"),
+    ("json_schema", "JSON Schema"),
+)
+MATRIX_MAX_BODY = 2 * 1024 * 1024
+MATRIX_TOOL_NAME = "llm_probe_lookup"
+MATRIX_SCHEMA = {
+    "type": "object",
+    "properties": {"status": {"type": "string", "enum": ["ok"]}},
+    "required": ["status"],
+    "additionalProperties": False,
+}
+MATRIX_NETWORK_DETAILS = {
+    "dns": "DNS 解析失败（域名不存在或无网络）",
+    "timeout": "请求超时",
+    "refused": "连接被拒绝（端口没开）",
+    "tls": "TLS 失败",
+    "net": "网络错误",
+}
+
+
+def _matrix_content_text(value):
+    """从 OpenAI 常见的字符串/分段 content 中提取文本。"""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        pieces = []
+        for item in value:
+            if isinstance(item, str):
+                pieces.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    pieces.append(text)
+        return "".join(pieces)
+    return ""
+
+
+def parse_chat_completion(data):
+    """校验一个最小、非流式 Chat Completions 响应。"""
+    if not isinstance(data, dict) or not isinstance(data.get("choices"), list) or not data["choices"]:
+        raise ValueError("缺少非空 choices")
+    choice = data["choices"][0]
+    message = choice.get("message") if isinstance(choice, dict) else None
+    if not isinstance(message, dict) or "content" not in message:
+        raise ValueError("缺少 message.content")
+    content = _matrix_content_text(message.get("content"))
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("message.content 不是非空文本")
+    return content, choice.get("finish_reason") or ""
+
+
+def parse_responses_object(data):
+    """校验 Responses API 的最小完成响应，允许 reasoning item 先于文本。"""
+    if not isinstance(data, dict) or data.get("object") != "response":
+        raise ValueError("object 不是 response")
+    if data.get("status") != "completed":
+        raise ValueError("status 不是 completed")
+    top_level = _matrix_content_text(data.get("output_text"))
+    if top_level.strip():
+        return top_level
+    for item in data.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for block in item.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "output_text":
+                text = _matrix_content_text(block.get("text"))
+                if text.strip():
+                    return text
+    raise ValueError("没有 output_text")
+
+
+def parse_sse_events(body):
+    """解析 SSE，返回事件、聚合文本，并要求标准 [DONE] 终止帧。
+
+    支持 CRLF、注释/keepalive 和多行 data；不把未解析的原始 SSE 放进报告。
+    """
+    if isinstance(body, bytes):
+        text = body.decode("utf-8", "replace")
+    else:
+        text = str(body)
+    events = []
+    data_lines = []
+    terminal = False
+
+    def flush():
+        nonlocal terminal
+        if not data_lines:
+            return
+        payload = "\n".join(data_lines)
+        data_lines[:] = []
+        if payload.strip() == "[DONE]":
+            terminal = True
+            return
+        try:
+            event = json.loads(payload)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SSE data 不是合法 JSON: %s" % exc)
+        if not isinstance(event, dict):
+            raise ValueError("SSE data 不是 JSON object")
+        events.append(event)
+
+    for line in text.splitlines():
+        if not line:
+            flush()
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip(" "))
+    flush()
+
+    if not terminal:
+        raise ValueError("SSE 缺少 [DONE]")
+    if not events:
+        raise ValueError("SSE 没有有效事件")
+    chunks = []
+    for event in events:
+        if event.get("object") != "chat.completion.chunk":
+            raise ValueError("SSE 事件不是 chat.completion.chunk")
+        if not isinstance(event.get("choices"), list):
+            raise ValueError("SSE chunk 缺少 choices")
+        choices = event["choices"]
+        if choices and isinstance(choices[0], dict):
+            delta = choices[0].get("delta") or {}
+            if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                chunks.append(delta["content"])
+    if not "".join(chunks).strip():
+        raise ValueError("SSE 没有文本 delta")
+    return events, "".join(chunks)
+
+
+def parse_tool_call(data):
+    """校验现代 tool_calls（不把旧 function_call 误判为支持）。"""
+    if not isinstance(data, dict) or not isinstance(data.get("choices"), list) or not data["choices"]:
+        raise ValueError("缺少非空 choices")
+    choice = data["choices"][0]
+    if not isinstance(choice, dict) or choice.get("finish_reason") != "tool_calls":
+        raise ValueError("finish_reason 不是 tool_calls")
+    message = choice.get("message") or {}
+    calls = message.get("tool_calls") if isinstance(message, dict) else None
+    if not isinstance(calls, list) or not calls:
+        raise ValueError("缺少 tool_calls")
+    call = calls[0]
+    function = call.get("function") if isinstance(call, dict) else None
+    if not isinstance(call, dict) or not call.get("id") or not isinstance(function, dict):
+        raise ValueError("tool_call 缺少 id/function")
+    if function.get("name") != MATRIX_TOOL_NAME:
+        raise ValueError("tool name 不匹配")
+    arguments = function.get("arguments")
+    if not isinstance(arguments, str):
+        raise ValueError("tool arguments 不是字符串")
+    try:
+        parsed = json.loads(arguments)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("tool arguments 不是合法 JSON: %s" % exc)
+    if parsed != {"city": "Paris"} or list(parsed) != ["city"]:
+        raise ValueError("tool arguments 不符合固定 schema")
+    return call
+
+
+def parse_schema_output(data):
+    """校验 response_format=json_schema 返回的严格小对象。"""
+    if not isinstance(data, dict) or not isinstance(data.get("choices"), list) or not data["choices"]:
+        raise ValueError("缺少非空 choices")
+    choice = data["choices"][0]
+    if not isinstance(choice, dict):
+        raise ValueError("choice 不是 object")
+    message = choice.get("message") or {}
+    raw = _matrix_content_text(message.get("content"))
+    if not raw.strip():
+        raise ValueError("schema 响应没有 content")
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("schema content 不是合法 JSON: %s" % exc)
+    if value != {"status": "ok"}:
+        raise ValueError("schema content 不符合固定 schema")
+    return value
+
+
+def _matrix_headers(key, stream=False):
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if stream:
+        headers["Accept"] = "text/event-stream"
+    if key:
+        headers["Authorization"] = "Bearer %s" % key
+    return headers
+
+
+def _matrix_payload(feature, model, max_tokens):
+    """构造五个可重复、无副作用的兼容性请求。"""
+    if feature == "chat_completions":
+        return {
+            "model": model, "messages": [{"role": "user", "content": "Reply with exactly OK."}],
+            "max_tokens": max_tokens, "temperature": 0,
+        }
+    if feature == "responses_api":
+        return {"model": model, "input": "Reply with exactly OK.",
+                "max_output_tokens": max_tokens, "temperature": 0}
+    if feature == "streaming_sse":
+        return {
+            "model": model, "messages": [{"role": "user", "content": "Reply with exactly OK."}],
+            "max_tokens": max_tokens, "temperature": 0, "stream": True,
+        }
+    if feature == "tool_calling":
+        return {
+            "model": model,
+            "messages": [{"role": "user", "content": "Look up Paris using the tool."}],
+            "max_tokens": max_tokens, "temperature": 0,
+            "tools": [{"type": "function", "function": {
+                "name": MATRIX_TOOL_NAME,
+                "description": "Return the city for a fixed compatibility probe.",
+                "parameters": {
+                    "type": "object", "properties": {"city": {"type": "string"}},
+                    "required": ["city"], "additionalProperties": False,
+                },
+            }}],
+            "tool_choice": {"type": "function", "function": {"name": MATRIX_TOOL_NAME}},
+        }
+    if feature == "json_schema":
+        return {
+            "model": model,
+            "messages": [{"role": "user", "content": 'Return exactly {"status":"ok"}.'}],
+            "max_tokens": max_tokens, "temperature": 0,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "llm_probe_result", "strict": True, "schema": MATRIX_SCHEMA,
+                },
+            },
+        }
+    raise ValueError("未知 matrix feature: %s" % feature)
+
+
+def _matrix_http_failure(result):
+    """把非 200/传输失败归入现有 2/3/4 语义。"""
+    error = result.get("error")
+    if error:
+        kind = error.get("kind")
+        if kind in ("dns", "timeout", "refused", "tls", "net"):
+            return kind, result["ms"], MATRIX_NETWORK_DETAILS.get(kind, "网络错误")
+        if kind == "body_too_large":
+            status = result.get("status", 0)
+            return "malformed", result["ms"], "HTTP %d 但响应体超过大小上限" % status
+        return "malformed", result["ms"], "请求失败: %s" % error.get("message", "")
+    status = result.get("status", 0)
+    if status in (401, 403):
+        return "auth", result["ms"], "HTTP %d：认证失败" % status
+    if 300 <= status < 400:
+        return "redirect", result["ms"], "HTTP %d：拒绝重定向" % status
+    if status in (404, 405):
+        return "unsupported", result["ms"], "HTTP %d：该能力未实现或路径不支持" % status
+    if status == 400:
+        return "badrequest", result["ms"], "HTTP 400：该能力不支持或请求被拒绝"
+    if status == 429:
+        return "ratelimit", result["ms"], "HTTP 429：限流 / 额度耗尽"
+    if status >= 500:
+        return "server", result["ms"], "HTTP %d：服务端错误" % status
+    return "client", result["ms"], "HTTP %d：异常响应" % status
+
+
+def _matrix_run_cell(feature, base_url, key, model, max_tokens, timeout):
+    stream = feature == "streaming_sse"
+    url = base_url.rstrip("/") + ("/responses" if feature == "responses_api" else "/chat/completions")
+    result = http_call(
+        url, "POST", _matrix_headers(key, stream=stream), _matrix_payload(feature, model, max_tokens),
+        timeout=timeout, max_body_bytes=MATRIX_MAX_BODY,
+    )
+    name = dict(MATRIX_CELLS)[feature]
+    if result.get("error") or result.get("status") != 200:
+        kind, elapsed, detail = _matrix_http_failure(result)
+        supported = False if kind in ("unsupported", "badrequest", "malformed", "client", "server", "ratelimit") else None
+        return {"id": feature, "name": name, "ok": False, "skipped": False,
+                "supported": supported, "status": result.get("status", 0), "kind": kind,
+                "ms": elapsed, "detail": detail}
+    try:
+        content_type = result.get("headers", {}).get("content-type", "").split(";", 1)[0].strip().lower()
+        if stream and content_type != "text/event-stream":
+            raise ValueError("Content-Type 不是 text/event-stream")
+        if feature == "chat_completions":
+            parse_chat_completion(json.loads(result["body"].decode("utf-8")))
+            detail = "HTTP 200，chat.completions 返回可解析回复"
+        elif feature == "responses_api":
+            parse_responses_object(json.loads(result["body"].decode("utf-8")))
+            detail = "HTTP 200，Responses API 返回可解析输出"
+        elif feature == "streaming_sse":
+            parse_sse_events(result["body"])
+            detail = "HTTP 200，SSE 事件与 [DONE] 完整"
+        elif feature == "tool_calling":
+            parse_tool_call(json.loads(result["body"].decode("utf-8")))
+            detail = "HTTP 200，tool_calls、arguments 与 finish_reason 有效"
+        else:
+            parse_schema_output(json.loads(result["body"].decode("utf-8")))
+            detail = "HTTP 200，JSON Schema 输出符合约定"
+    except (UnicodeDecodeError, ValueError, TypeError, KeyError, AttributeError, IndexError) as exc:
+        return {"id": feature, "name": name, "ok": False, "skipped": False,
+                "supported": False, "status": result.get("status", 0), "kind": "malformed",
+                "ms": result["ms"], "detail": "HTTP 200 但响应格式不符合 OpenAI 兼容约定"}
+    return {"id": feature, "name": name, "ok": True, "skipped": False, "supported": True,
+            "status": 200, "kind": None, "ms": result["ms"], "detail": detail}
+
+
+def _matrix_skip(feature, detail="前置能力失败，已跳过（--all 可强制执行）", kind=None):
+    name = dict(MATRIX_CELLS)[feature]
+    return {"id": feature, "name": name, "ok": False, "skipped": True,
+            "supported": None, "status": 0, "kind": kind, "ms": 0.0, "detail": detail}
+
+
+def matrix_verdict(steps, allow_unsupported=False):
+    """汇总兼容矩阵，保持 2/3/4 的全局退出码优先级。"""
+    passed = sum(1 for step in steps if step.get("ok"))
+    skipped = sum(1 for step in steps if step.get("skipped"))
+    failed = len(steps) - passed - skipped
+    failures = [step for step in steps if not step.get("ok") and not step.get("skipped")]
+    chat_step = next((step for step in steps if step.get("id") == "chat_completions"), None)
+    chat_ok = bool(chat_step and chat_step.get("ok"))
+    network_kinds = ("dns", "timeout", "refused", "tls", "net")
+    network_steps = [step for step in steps if step.get("kind") in network_kinds]
+    if network_steps:
+        first = network_steps[0]
+        return 2, "网络不可达：%s" % first["detail"], {"passed": passed, "failed": failed,
+                                                    "skipped": skipped, "total": len(steps)}
+    if any(step.get("kind") == "auth" for step in failures):
+        first = next(step for step in failures if step.get("kind") == "auth")
+        return 3, "认证失败：%s" % first["detail"], {"passed": passed, "failed": failed,
+                                                    "skipped": skipped, "total": len(steps)}
+    if failures and allow_unsupported and chat_ok and all(
+            step.get("kind") == "unsupported" for step in failures):
+        ids = "、".join(step["id"] for step in failures)
+        return 0, "兼容能力通过（未实现：%s）" % ids, {"passed": passed, "failed": failed,
+                                                     "skipped": skipped, "total": len(steps)}
+    if failures:
+        ids = "、".join(step["id"] for step in failures)
+        if not ids:
+            ids = "chat_completions"
+        return 4, "兼容能力不通过：%s" % ids, {"passed": passed, "failed": failed,
+                                             "skipped": skipped, "total": len(steps)}
+    if not chat_ok:
+        return 4, "兼容能力不通过：chat_completions", {"passed": passed, "failed": failed,
+                                                       "skipped": skipped, "total": len(steps)}
+    return 0, "兼容能力通过：%d 项" % len(steps), {"passed": passed, "failed": failed,
+                                                 "skipped": skipped, "total": len(steps)}
+
+
+def run_compatibility_matrix(base_url, key, model, max_tokens, timeout, force_all=False,
+                             allow_unsupported=False):
+    """运行五个显式兼容性单元；默认在传输/认证故障后跳过后续请求。"""
+    network = step_network(base_url, timeout)
+    if not network.get("ok"):
+        network_kind = network.get("kind") or "net"
+        steps = [_matrix_skip(feature, network["detail"], kind=network_kind)
+                 for feature, _ in MATRIX_CELLS]
+        code, verdict, summary = matrix_verdict(steps)
+        return steps, code, verdict, summary
+    steps = []
+    gated = False
+    for feature, _ in MATRIX_CELLS:
+        if gated and not force_all:
+            steps.append(_matrix_skip(feature))
+            continue
+        row = _matrix_run_cell(feature, base_url, key, model, max_tokens, timeout)
+        steps.append(row)
+        if (not row["ok"] and not force_all and
+                row.get("kind") in ("dns", "timeout", "refused", "tls", "net", "auth", "ratelimit")):
+            gated = True
+    code, verdict, summary = matrix_verdict(steps, allow_unsupported=allow_unsupported)
+    return steps, code, verdict, summary
+
+
 def step_sdk(base_url, key, model, prompt, timeout):
     try:
         import openai  # noqa
@@ -664,6 +1095,12 @@ def print_report(result, as_json=False):
         if step.get("content"):
             snippet = step["content"].replace("\n", " ")[:200]
             print(f"          回复: {snippet}")
+    if result.get("mode") == "compatibility":
+        summary = result.get("summary", {})
+        print("-" * 60)
+        print("矩阵   : %d 通过 / %d 失败 / %d 跳过 / %d 总计" % (
+            summary.get("passed", 0), summary.get("failed", 0),
+            summary.get("skipped", 0), summary.get("total", total)))
     print("-" * 60)
     mark = "✅" if result["exit_code"] == 0 else "❌"
     print(f"结论 {mark} {result['verdict']}")
@@ -675,6 +1112,12 @@ def print_report(result, as_json=False):
 # 子命令
 # ---------------------------------------------------------------------------
 def cmd_probe(args):
+    if getattr(args, "allow_unsupported", False) and not getattr(args, "matrix", False):
+        print("参数错误：--allow-unsupported 只能与 --matrix 同时使用", file=sys.stderr)
+        return 1
+    if getattr(args, "matrix", False) and (args.only or args.sdk):
+        print("参数错误：--matrix 不能与 --only 或 --sdk 同时使用", file=sys.stderr)
+        return 1
     config_path = os.path.expanduser(args.config)
     cfg = {}
     if os.path.exists(config_path):
@@ -721,10 +1164,30 @@ def cmd_probe(args):
     else:
         key, key_source = resolve_key(args, cfg)
 
-    # L1 是裸 socket，天然不走代理；--direct 让 L2/L3 也绕开代理，保持口径一致
-    if args.direct:
-        urllib.request.install_opener(
-            urllib.request.build_opener(urllib.request.ProxyHandler({})))
+    # L1 是裸 socket，天然不走代理；--direct 让 L2/L3 也绕开代理，保持口径一致。
+    # HTTP opener 同时拒绝跨 origin 重定向，避免 Authorization 被转发到第三方。
+    install_http_opener(direct=args.direct)
+
+    if getattr(args, "matrix", False):
+        steps, code, verdict, summary = run_compatibility_matrix(
+            base_url, key, model, max_tokens, timeout, force_all=args.all,
+            allow_unsupported=getattr(args, "allow_unsupported", False),
+        )
+        result = {
+            "version": VERSION,
+            "mode": "compatibility",
+            "base_url": base_url,
+            "model": model,
+            "key_masked": mask_secret(key),
+            "key_source": key_source,
+            "config": config_path if os.path.exists(config_path) else None,
+            "steps": steps,
+            "summary": summary,
+            "verdict": verdict,
+            "exit_code": code,
+        }
+        print_report(result, args.json)
+        return code
 
     # --only 决定跑哪几层：net=L1；auth=L1+L2；infer=L1+L3；sdk=L1+L4；缺省全跑
     only = args.only
@@ -924,7 +1387,8 @@ def build_parser():
   python3 llm_probe.py setkey                交互写入加密密钥
   python3 llm_probe.py probe                 分层探测（不写 probe 也行）
   python3 llm_probe.py probe --sdk           追加真实 openai SDK 调用
-  python3 llm_probe.py probe --json          机器可读输出
+  python3 llm_probe.py probe --matrix        五项 OpenAI 兼容能力矩阵
+  python3 llm_probe.py probe --matrix --json  机器可读的兼容矩阵
   python3 llm_probe.py --base-url https://api.openai.com/v1 --model gpt-4o-mini
 
 退出码:
@@ -948,6 +1412,10 @@ def build_parser():
                        help="只跑某一层: net=L1 / auth=L1+L2 / infer=L1+L3 / sdk=L1+L4")
     probe.add_argument("--all", action="store_true", help="认证失败也继续测推理")
     probe.add_argument("--sdk", action="store_true", help="追加 openai SDK 真实调用")
+    probe.add_argument("--matrix", action="store_true",
+                       help="运行五项 OpenAI 兼容能力矩阵（chat/responses/stream/tools/schema）")
+    probe.add_argument("--allow-unsupported", action="store_true",
+                       help="chat 已通过时，矩阵中仅 404/405 未实现能力仍返回 0")
     probe.add_argument("--direct", action="store_true",
                        help="不走系统代理（绕过 http_proxy/https_proxy）")
     probe.add_argument("--json", action="store_true", help="JSON 输出")
